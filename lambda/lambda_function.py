@@ -1,6 +1,6 @@
 """
 Lambda: multi-region-failover
-Triggered by CloudWatch Alarm when the primary RDS instance becomes unhealthy.
+Triggered by CloudWatch Alarm when primary RDS becomes unhealthy.
 Steps:
   1. Parse CloudWatch alarm from SNS event
   2. Verify primary RDS is truly unavailable (avoid false positives)
@@ -38,7 +38,6 @@ def lambda_handler(event, context):
 
     target_region = event.get("target_region", REPLICA_REGION)
 
-    # Step 1 - parse alarm (SNS trigger)
     alarm_state = "ALARM"
     if "Records" in event:
         try:
@@ -51,22 +50,19 @@ def lambda_handler(event, context):
             return {"statusCode": 400, "body": "Invalid event format"}
 
     if alarm_state != "ALARM" and action != "failover":
-        logger.info("No failover needed, state: %s", alarm_state)
         return {"statusCode": 200, "body": "No action needed"}
 
-    # Step 2 - verify primary is truly down (avoid false positives)
     rds_primary = boto3.client("rds", region_name=PRIMARY_REGION)
     try:
         resp   = rds_primary.describe_db_instances(DBInstanceIdentifier="mr-postgres-primary")
         status = resp["DBInstances"][0]["DBInstanceStatus"]
         logger.info("Primary DB status: %s", status)
         if status in ("available", "backing-up", "modifying"):
-            logger.warning("Primary reports '%s' — possible false positive; aborting", status)
+            logger.warning("Primary reports %s - possible false positive; aborting", status)
             return {"statusCode": 200, "body": f"Primary still {status}, no failover"}
     except Exception as exc:
-        logger.warning("Cannot reach primary RDS (%s) — proceeding with failover", exc)
+        logger.warning("Cannot reach primary RDS (%s) - proceeding with failover", exc)
 
-    # Step 3 - promote replica
     rds_replica = boto3.client("rds", region_name=target_region)
     logger.info("Promoting %s in %s...", REPLICA_DB_IDENTIFIER, target_region)
     try:
@@ -81,9 +77,8 @@ def lambda_handler(event, context):
         )
         logger.info("Replica promotion complete")
     except Exception as exc:
-        logger.warning("Promotion issue: %s — may still be in progress", exc)
+        logger.warning("Promotion issue: %s - may still be in progress", exc)
 
-    # Step 4 - update Route 53 to remove failed region from DNS rotation
     if HOSTED_ZONE_ID and FAILED_REGION_ELB:
         try:
             r53 = boto3.client("route53")
@@ -108,7 +103,6 @@ def lambda_handler(event, context):
         except Exception as exc:
             logger.warning("Route 53 update failed: %s", exc)
 
-    # Step 5 - notify
     _notify(
         f"DB FAILOVER COMPLETE\n"
         f"Promoted: {REPLICA_DB_IDENTIFIER} ({target_region})\n"
@@ -130,7 +124,7 @@ def lambda_handler(event, context):
 
 def _notify(message: str):
     if not SNS_ALERT_TOPIC_ARN:
-        logger.info("No SNS topic configured — skipping notification")
+        logger.info("No SNS topic configured - skipping notification")
         return
     try:
         boto3.client("sns", region_name=PRIMARY_REGION).publish(
