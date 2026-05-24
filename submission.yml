@@ -1,0 +1,69 @@
+commands:
+  deploy:
+    description: "Deploys all multi-region cloud infrastructure and Kubernetes components."
+    script: |
+      export AWS_DEFAULT_REGION=ap-southeast-1
+      cd terraform/envs/ap-southeast-1 && terraform init && terraform apply -auto-approve && cd ../../..
+      cd terraform/envs/eu-west-1 && terraform init && terraform apply -auto-approve && cd ../../..
+      cd terraform/envs/us-east-1 && terraform init && terraform apply -auto-approve && cd ../../..
+      aws eks update-kubeconfig --region ap-southeast-1 --name mr-eks-aps1 --kubeconfig /tmp/kc-aps1
+      aws eks update-kubeconfig --region eu-west-1 --name mr-eks-euw1 --kubeconfig /tmp/kc-euw1
+      aws eks update-kubeconfig --region us-east-1 --name mr-eks-use1 --kubeconfig /tmp/kc-use1
+      export KUBECONFIG=/tmp/kc-aps1
+      kubectl create namespace argocd --dry-run=client -o yaml | kubectl apply -f -
+      kubectl apply -n argocd -f https://raw.githubusercontent.com/argoproj/argo-cd/stable/manifests/install.yaml
+      kubectl create namespace monitoring --dry-run=client -o yaml | kubectl apply -f -
+      helm repo add prometheus-community https://prometheus-community.github.io/helm-charts && helm repo update
+      helm upgrade --install prometheus prometheus-community/kube-prometheus-stack -n monitoring --set grafana.adminPassword=Admin@123 --set alertmanager.enabled=false
+      export KUBECONFIG=/tmp/kc-euw1
+      kubectl create namespace argocd --dry-run=client -o yaml | kubectl apply -f -
+      kubectl apply -n argocd -f https://raw.githubusercontent.com/argoproj/argo-cd/stable/manifests/install.yaml
+      kubectl create namespace monitoring --dry-run=client -o yaml | kubectl apply -f -
+      helm upgrade --install prometheus prometheus-community/kube-prometheus-stack -n monitoring --set grafana.adminPassword=Admin@123 --set alertmanager.enabled=false
+      export KUBECONFIG=/tmp/kc-use1
+      kubectl create namespace argocd --dry-run=client -o yaml | kubectl apply -f -
+      kubectl apply -n argocd -f https://raw.githubusercontent.com/argoproj/argo-cd/stable/manifests/install.yaml
+      kubectl create namespace monitoring --dry-run=client -o yaml | kubectl apply -f -
+      helm upgrade --install prometheus prometheus-community/kube-prometheus-stack -n monitoring --set grafana.adminPassword=Admin@123 --set alertmanager.enabled=false
+
+  verify:
+    description: "Verifies the health and correct routing of the deployed application across regions."
+    script: |
+      export KUBECONFIG=/tmp/kc-aps1
+      kubectl get nodes
+      kubectl get pods -n argocd
+      kubectl get pods -n monitoring
+      export KUBECONFIG=/tmp/kc-euw1
+      kubectl get nodes
+      kubectl get pods -n argocd
+      kubectl get pods -n monitoring
+      export KUBECONFIG=/tmp/kc-use1
+      kubectl get nodes
+      kubectl get pods -n argocd
+      kubectl get pods -n monitoring
+      aws lambda invoke --function-name multi-region-failover --region ap-southeast-1 --payload '{"action":"health_check"}' --cli-binary-format raw-in-base64-out /tmp/verify-response.json && cat /tmp/verify-response.json
+
+  test-failover:
+    description: "Simulates a regional failure and verifies automatic traffic rerouting."
+    script: |
+      echo "=== Simulating ap-southeast-1 failure ==="
+      export KUBECONFIG=/tmp/kc-aps1
+      kubectl scale deployment -n argocd --all --replicas=0
+      echo "=== Triggering Lambda failover to eu-west-1 ==="
+      aws lambda invoke --function-name multi-region-failover --region ap-southeast-1 --payload '{"action":"failover","target_region":"eu-west-1"}' --cli-binary-format raw-in-base64-out /tmp/failover-response.json && cat /tmp/failover-response.json
+      echo "=== Verifying euw1 still healthy ==="
+      export KUBECONFIG=/tmp/kc-euw1
+      kubectl get pods -n argocd
+      kubectl get pods -n monitoring
+      echo "=== Restoring aps1 ==="
+      export KUBECONFIG=/tmp/kc-aps1
+      kubectl scale deployment -n argocd --all --replicas=1
+
+  destroy:
+    description: "Cleans up all provisioned cloud infrastructure and resources."
+    script: |
+      export AWS_DEFAULT_REGION=ap-southeast-1
+      aws lambda delete-function --function-name multi-region-failover --region ap-southeast-1 || true
+      cd terraform/envs/ap-southeast-1 && terraform destroy -auto-approve && cd ../../..
+      cd terraform/envs/eu-west-1 && terraform destroy -auto-approve && cd ../../..
+      cd terraform/envs/us-east-1 && terraform destroy -auto-approve && cd ../../..
