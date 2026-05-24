@@ -18,7 +18,10 @@ spec:
       topologySpreadConstraints:
       - maxSkew: 1
         topologyKey: kubernetes.io/hostname
-        whenUnsatisfiable: DoNotSchedule
+        # ScheduleAnyway (not DoNotSchedule) — with only 2 nodes and 3 replicas
+        # a maxSkew:1 constraint can never be satisfied at schedule time under
+        # DoNotSchedule, causing pods to remain Pending indefinitely.
+        whenUnsatisfiable: ScheduleAnyway
         labelSelector:
           matchLabels:
             app: webapp

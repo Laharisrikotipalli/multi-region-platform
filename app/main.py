@@ -1,5 +1,6 @@
 import asyncio
 import os
+import signal
 import socket
 import time
 
@@ -19,7 +20,7 @@ from prometheus_fastapi_instrumentator import Instrumentator
 DATABASE_URL  = os.environ["DATABASE_URL"]   # postgresql://user:pass@host/db
 REDIS_URL     = os.environ["REDIS_URL"]      # redis://host:6379
 REGION        = os.getenv("AWS_REGION", "unknown")
-OTLP_ENDPOINT = os.getenv("OTLP_ENDPOINT", "http://tempo:4317")
+OTLP_ENDPOINT = os.getenv("OTLP_ENDPOINT", "http://tempo.monitoring.svc.cluster.local:4317")
 
 # ── OpenTelemetry tracing ─────────────────────────────────────────────────────
 provider = TracerProvider()
@@ -32,11 +33,31 @@ tracer = trace.get_tracer(__name__)
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    # ── Startup ───────────────────────────────────────────────────────────────
     app.state.db    = await asyncpg.create_pool(DATABASE_URL, min_size=1, max_size=5)
     app.state.redis = aioredis.from_url(REDIS_URL, decode_responses=True)
+
+    # ── Graceful SIGTERM handler (Kubernetes sends SIGTERM before SIGKILL) ────
+    # Ensures the connection pool is closed cleanly even when the container is
+    # terminated by the kubelet, preventing connection leaks on the DB side.
+    loop = asyncio.get_event_loop()
+
+    def _handle_sigterm():
+        loop.create_task(_shutdown(app))
+
+    loop.add_signal_handler(signal.SIGTERM, _handle_sigterm)
+
     yield
-    await app.state.db.close()
-    await app.state.redis.aclose()
+
+    # ── Shutdown (normal path: SIGINT / uvicorn reload) ───────────────────────
+    await _shutdown(app)
+
+
+async def _shutdown(app: FastAPI):
+    if hasattr(app.state, "db") and app.state.db:
+        await app.state.db.close()
+    if hasattr(app.state, "redis") and app.state.redis:
+        await app.state.redis.aclose()
 
 
 app = FastAPI(title="Multi-Region Platform", version="1.0.0", lifespan=lifespan)

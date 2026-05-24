@@ -4,7 +4,6 @@ metadata:
   name: multi-region-app
   namespace: multi-region
   annotations:
-    # AWS Load Balancer Controller – expose via AWS ELB
     service.beta.kubernetes.io/aws-load-balancer-type: "external"
     service.beta.kubernetes.io/aws-load-balancer-scheme: "internet-facing"
 spec:

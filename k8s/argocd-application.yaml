@@ -3,6 +3,7 @@ kind: Application
 metadata:
   name: multi-region-app
   namespace: argocd
+  annotations:
 spec:
   project: default
   source:

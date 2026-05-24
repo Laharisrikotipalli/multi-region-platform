@@ -8,6 +8,8 @@ commands:
       : "${AWS_ACCESS_KEY_ID:?AWS_ACCESS_KEY_ID is required}"
       : "${AWS_SECRET_ACCESS_KEY:?AWS_SECRET_ACCESS_KEY is required}"
       : "${GRAFANA_PASSWORD:?GRAFANA_PASSWORD is required}"
+      : "${DATABASE_URL:?DATABASE_URL is required}"
+      : "${REDIS_URL:?REDIS_URL is required}"
       export AWS_DEFAULT_REGION=ap-southeast-1
 
       # ── terraform: provision all 3 regions ───────────────────────────────
@@ -24,36 +26,91 @@ commands:
       aws eks update-kubeconfig --region eu-west-1      --name mr-eks-euw1 --kubeconfig /tmp/kc-euw1
       aws eks update-kubeconfig --region us-east-1      --name mr-eks-use1 --kubeconfig /tmp/kc-use1
 
+      # ── deploy Lambda failover function ──────────────────────────────────
+      # Create or update the failover Lambda (idempotent via || update-function-code)
+      aws lambda create-function \
+        --function-name multi-region-failover \
+        --runtime python3.12 \
+        --role arn:aws:iam::$(aws sts get-caller-identity --query Account --output text):role/lambda-failover-role \
+        --handler handler.lambda_handler \
+        --zip-file fileb://lambda/failover.zip \
+        --region ap-southeast-1 2>/dev/null || \
+      aws lambda update-function-code \
+        --function-name multi-region-failover \
+        --zip-file fileb://lambda/failover.zip \
+        --region ap-southeast-1
+
       # ── deploy to each cluster ────────────────────────────────────────────
       for KC in /tmp/kc-aps1 /tmp/kc-euw1 /tmp/kc-use1; do
         export KUBECONFIG=$KC
-        echo "=== Deploying to cluster: $KC ==="
+
+        # Derive region name from kubeconfig path for injecting into the Deployment
+        case $KC in
+          */kc-aps1) CLUSTER_REGION=ap-southeast-1 ;;
+          */kc-euw1) CLUSTER_REGION=eu-west-1 ;;
+          */kc-use1) CLUSTER_REGION=us-east-1 ;;
+        esac
+
+        echo "=== Deploying to cluster: $CLUSTER_REGION ==="
 
         # namespaces
         kubectl create namespace argocd       --dry-run=client -o yaml | kubectl apply -f -
         kubectl create namespace monitoring   --dry-run=client -o yaml | kubectl apply -f -
         kubectl create namespace multi-region --dry-run=client -o yaml | kubectl apply -f -
 
+        # app-secrets — must exist before Deployment pods start
+        kubectl create secret generic app-secrets \
+          -n multi-region \
+          --from-literal=database-url="${DATABASE_URL}" \
+          --from-literal=redis-url="${REDIS_URL}" \
+          --dry-run=client -o yaml | kubectl apply -f -
+
         # ArgoCD
         kubectl apply -n argocd -f https://raw.githubusercontent.com/argoproj/argo-cd/stable/manifests/install.yaml
 
-        # Prometheus + Grafana (password from env var)
+        # Helm repos
         helm repo add prometheus-community https://prometheus-community.github.io/helm-charts --force-update
+        helm repo add grafana              https://grafana.github.io/helm-charts             --force-update
         helm repo update
+
+        # Prometheus + Grafana
         helm upgrade --install prometheus prometheus-community/kube-prometheus-stack \
           -n monitoring \
           --set grafana.adminPassword="${GRAFANA_PASSWORD}" \
           --set alertmanager.enabled=false \
           --wait --timeout=5m
 
+        # Loki (log aggregation)
+        helm upgrade --install loki grafana/loki-stack \
+          -n monitoring \
+          --set grafana.enabled=false \
+          --wait --timeout=5m
+
+        # Tempo (distributed tracing — receives OTLP on port 4317)
+        helm upgrade --install tempo grafana/tempo \
+          -n monitoring \
+          --wait --timeout=5m
+
         # Jaeger distributed tracing
         kubectl apply -f k8s/monitoring/jaeger.yaml
 
-        # Webapp
+        # ServiceMonitor for the webapp
+        kubectl apply -f k8s/monitoring/app-servicemonitor.yaml
+
+        # Patch app-deployment.yaml with the correct region env var for this cluster,
+        # then apply. Using envsubst so the value is injected at deploy time.
+        CLUSTER_REGION=$CLUSTER_REGION envsubst < k8s/app/app-deployment.yaml | kubectl apply -f -
+        kubectl apply -f k8s/app/app-service.yaml
+
+        # Nginx webapp (used by verify / test-failover HTTP checks)
         kubectl apply -f k8s/app/deployment.yaml
+
+        # ArgoCD Application manifest
+        kubectl apply -f k8s/argocd/argocd-application.yaml
 
         # Wait for webapp pods to be ready
         kubectl rollout status deployment/webapp -n multi-region --timeout=3m
+        kubectl rollout status deployment/multi-region-app -n multi-region --timeout=3m
       done
 
       echo "=== Deploy complete: all 3 regions ==="
@@ -62,7 +119,6 @@ commands:
     description: "Verifies the health and correct routing of the deployed application across regions."
     script: |
       set -e
-      export KUBECONFIG=/tmp/kc-aps1
       aws eks update-kubeconfig --region ap-southeast-1 --name mr-eks-aps1 --kubeconfig /tmp/kc-aps1 2>/dev/null || true
       aws eks update-kubeconfig --region eu-west-1      --name mr-eks-euw1 --kubeconfig /tmp/kc-euw1 2>/dev/null || true
       aws eks update-kubeconfig --region us-east-1      --name mr-eks-use1 --kubeconfig /tmp/kc-use1 2>/dev/null || true
@@ -143,13 +199,21 @@ commands:
         echo "Baseline $REGION: HTTP $CODE"
       done
 
-      # ── step 2: simulate aps1 failure by scaling webapp to 0 ─────────────
-      echo "=== Simulating ap-southeast-1 failure: scaling webapp to 0 ==="
+      # ── step 2: suspend ArgoCD auto-sync to prevent selfHeal interference ─
+      echo "=== Suspending ArgoCD auto-sync on aps1 ==="
       export KUBECONFIG=/tmp/kc-aps1
+      argocd app set multi-region-app --sync-policy none --server https://kubernetes.default.svc \
+        --insecure 2>/dev/null || \
+      kubectl patch application multi-region-app -n argocd \
+        --type=merge -p '{"spec":{"syncPolicy":null}}'
+
+      # ── step 3: simulate aps1 failure by scaling webapp to 0 ─────────────
+      echo "=== Simulating ap-southeast-1 failure: scaling webapp to 0 ==="
       kubectl scale deployment webapp -n multi-region --replicas=0
+      kubectl scale deployment multi-region-app -n multi-region --replicas=0
       echo "Scaled webapp to 0 in aps1"
 
-      # ── step 3: trigger Lambda failover ──────────────────────────────────
+      # ── step 4: trigger Lambda failover ──────────────────────────────────
       echo "=== Triggering Lambda failover ==="
       aws lambda invoke \
         --function-name multi-region-failover \
@@ -159,11 +223,11 @@ commands:
         /tmp/failover-response.json
       echo "Failover response: $(cat /tmp/failover-response.json)"
 
-      # ── step 4: wait for Route 53 health checks to reroute (60s) ─────────
+      # ── step 5: wait for Route 53 health checks to reroute (60s) ─────────
       echo "=== Waiting 60s for Route 53 health checks to detect failure ==="
       sleep 60
 
-      # ── step 5: verify euw1 + use1 still serve traffic ───────────────────
+      # ── step 6: verify euw1 + use1 still serve traffic ───────────────────
       echo "=== Post-failover verification: euw1 and use1 must return 200 ==="
       FAIL=0
       for ENTRY in "euw1|$EUW1_ELB" "use1|$USE1_ELB"; do
@@ -177,11 +241,17 @@ commands:
         fi
       done
 
-      # ── step 6: restore aps1 ─────────────────────────────────────────────
+      # ── step 7: restore aps1 and re-enable auto-sync ─────────────────────
       echo "=== Restoring aps1: scaling webapp back to 3 ==="
       export KUBECONFIG=/tmp/kc-aps1
       kubectl scale deployment webapp -n multi-region --replicas=3
+      kubectl scale deployment multi-region-app -n multi-region --replicas=3
       kubectl rollout status deployment/webapp -n multi-region --timeout=3m
+      kubectl rollout status deployment/multi-region-app -n multi-region --timeout=3m
+
+      echo "=== Re-enabling ArgoCD auto-sync on aps1 ==="
+      kubectl patch application multi-region-app -n argocd \
+        --type=merge -p '{"spec":{"syncPolicy":{"automated":{"prune":true,"selfHeal":true}}}}'
       echo "aps1 restored"
 
       if [ "$FAIL" -ne 0 ]; then

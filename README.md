@@ -6,7 +6,7 @@ High-availability Kubernetes platform deployed across three AWS regions using Am
 
 | Layer | Technology | Details |
 |---|---|---|
-| Compute | Amazon EKS 1.29 | One cluster per region: `ap-southeast-1`, `eu-west-1`, `us-east-1` |
+| Compute | Amazon EKS 1.30 | One cluster per region: `ap-southeast-1`, `eu-west-1`, `us-east-1` |
 | Networking | AWS VPC | Each cluster has its own VPC with public/private subnets and NAT gateway |
 | Load Balancing | Kubernetes `Service: LoadBalancer` | Creates an AWS ELB per region automatically |
 | Traffic Management | Amazon Route 53 | Latency-based routing; health checks remove unhealthy regions |
@@ -24,14 +24,28 @@ eu-west-1       (replica)   VPC 10.1.0.0/16   mr-eks-euw1
 us-east-1       (replica)   VPC 10.2.0.0/16   mr-eks-use1
 ```
 
-## Deployment
+## Required Environment Variables
 
 ```bash
 export AWS_ACCESS_KEY_ID=...
 export AWS_SECRET_ACCESS_KEY=...
+export GRAFANA_PASSWORD=...          # Grafana admin password — never commit this
+export DATABASE_URL=...              # postgresql://user:pass@host/db
+export REDIS_URL=...                 # redis://host:6379
 export ALERT_EMAIL=ops@example.com
+```
+
+## Deployment
+
+```bash
 bash scripts/deploy.sh
 ```
+
+The deploy script will:
+1. Run `terraform apply` across all three regions
+2. Install ArgoCD, Prometheus, Loki, Tempo, and the webapp on each cluster
+3. Create the `app-secrets` Kubernetes Secret on each cluster
+4. Wait for all rollouts to complete
 
 ## Health Check
 
@@ -49,7 +63,8 @@ export ROUTE53_FQDN=app.example.com
 bash scripts/test-failover.sh
 ```
 
-Scales `ap-southeast-1` to zero replicas and verifies traffic reroutes to another region within 120 seconds.
+Suspends ArgoCD auto-sync, scales `ap-southeast-1` to zero replicas, and verifies traffic
+reroutes to another region within 120 seconds. Restores aps1 and re-enables auto-sync on completion.
 
 ## Observability
 
@@ -62,4 +77,4 @@ Access Grafana:
 ```bash
 kubectl port-forward svc/prometheus-grafana 3000:80 -n monitoring
 ```
-Open `http://localhost:3000` (default credentials in `prometheus-values.yaml`).
+Open `http://localhost:3000` — credentials are set via the `$GRAFANA_PASSWORD` environment variable at deploy time.

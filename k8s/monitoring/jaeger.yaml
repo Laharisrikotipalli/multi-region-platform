@@ -23,6 +23,8 @@ spec:
           name: ui
         - containerPort: 14268
           name: collector
+        - containerPort: 4317
+          name: otlp-grpc
         - containerPort: 6831
           protocol: UDP
           name: agent
@@ -53,3 +55,6 @@ spec:
   - name: collector
     port: 14268
     targetPort: 14268
+  - name: otlp-grpc
+    port: 4317
+    targetPort: 4317

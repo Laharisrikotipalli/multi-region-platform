@@ -4,6 +4,10 @@ metadata:
   name: multi-region-app
   namespace: monitoring
   labels:
+    # This label must match the Helm release name used when installing
+    # kube-prometheus-stack. The deploy script installs it as 'prometheus'
+    # (helm upgrade --install prometheus ...), so this value is correct.
+    # If you rename the Helm release, update this label to match.
     release: prometheus
 spec:
   namespaceSelector:

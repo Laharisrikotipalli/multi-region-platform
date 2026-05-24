@@ -25,10 +25,11 @@ spec:
           ports:
             - containerPort: 8000
           env:
+            # CLUSTER_REGION is substituted by envsubst in the deploy script.
+            # topology.kubernetes.io/region is a node label, not a pod annotation,
+            # so fieldRef cannot read it — inject the value statically per cluster.
             - name: AWS_REGION
-              valueFrom:
-                fieldRef:
-                  fieldPath: metadata.annotations['topology.kubernetes.io/region']
+              value: "${CLUSTER_REGION}"
             - name: DATABASE_URL
               valueFrom:
                 secretKeyRef:
