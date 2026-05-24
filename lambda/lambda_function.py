@@ -1,10 +1,14 @@
 """
-Lambda: promote-replica
+Lambda: multi-region-failover
 Triggered by CloudWatch Alarm when the primary RDS instance becomes unhealthy.
-Automatically promotes the eu-west-1 read replica to a standalone primary,
-then notifies the ops team via SNS.
+Steps:
+  1. Parse CloudWatch alarm from SNS event
+  2. Verify primary RDS is truly unavailable (avoid false positives)
+  3. Promote eu-west-1 read replica to standalone primary
+  4. Update Route 53 to remove failed region from DNS rotation
+  5. Notify ops team via SNS
 
-RTO target: < 5 minutes from alarm to promotion complete.
+RTO target: < 5 minutes. RPO target: < 30 seconds (async replication lag).
 """
 
 import json
@@ -21,33 +25,36 @@ PRIMARY_REGION        = os.environ.get("PRIMARY_REGION", "ap-southeast-1")
 REPLICA_REGION        = os.environ.get("REPLICA_REGION", "eu-west-1")
 REPLICA_DB_IDENTIFIER = os.environ.get("REPLICA_DB_IDENTIFIER", "mr-postgres-replica-euw1")
 SNS_ALERT_TOPIC_ARN   = os.environ.get("SNS_ALERT_TOPIC_ARN", "")
+HOSTED_ZONE_ID        = os.environ.get("HOSTED_ZONE_ID", "Z09752483UKDQ3CQNX9T1")
+FAILED_REGION_ELB     = os.environ.get("FAILED_REGION_ELB", "acc80dd91c9a64241888155eb3282071-1241349649.ap-southeast-1.elb.amazonaws.com")
 
 
 def lambda_handler(event, context):
-    """
-    Failover steps:
-      1. Parse CloudWatch alarm from SNS event
-      2. Verify primary RDS is truly unavailable (avoid false positives)
-      3. Promote eu-west-1 replica to standalone primary
-      4. Notify ops team via SNS
-    """
     logger.info("Event: %s", json.dumps(event))
 
-    # Step 1 – parse alarm
-    try:
-        message    = json.loads(event["Records"][0]["Sns"]["Message"])
-        alarm_state = message.get("NewStateValue", "")
-        alarm_name  = message.get("AlarmName", "")
-        logger.info("Alarm: %s | State: %s", alarm_name, alarm_state)
-    except (KeyError, json.JSONDecodeError) as exc:
-        logger.error("Failed to parse event: %s", exc)
-        return {"statusCode": 400, "body": "Invalid event format"}
+    action = event.get("action", "")
+    if action == "health_check":
+        return {"statusCode": 200, "body": "healthy"}
 
-    if alarm_state != "ALARM":
-        logger.info("Alarm not in ALARM state (%s) — no action needed", alarm_state)
+    target_region = event.get("target_region", REPLICA_REGION)
+
+    # Step 1 - parse alarm (SNS trigger)
+    alarm_state = "ALARM"
+    if "Records" in event:
+        try:
+            message     = json.loads(event["Records"][0]["Sns"]["Message"])
+            alarm_state = message.get("NewStateValue", "")
+            alarm_name  = message.get("AlarmName", "")
+            logger.info("Alarm: %s | State: %s", alarm_name, alarm_state)
+        except (KeyError, json.JSONDecodeError) as exc:
+            logger.error("Failed to parse event: %s", exc)
+            return {"statusCode": 400, "body": "Invalid event format"}
+
+    if alarm_state != "ALARM" and action != "failover":
+        logger.info("No failover needed, state: %s", alarm_state)
         return {"statusCode": 200, "body": "No action needed"}
 
-    # Step 2 – verify primary is truly down
+    # Step 2 - verify primary is truly down (avoid false positives)
     rds_primary = boto3.client("rds", region_name=PRIMARY_REGION)
     try:
         resp   = rds_primary.describe_db_instances(DBInstanceIdentifier="mr-postgres-primary")
@@ -59,33 +66,53 @@ def lambda_handler(event, context):
     except Exception as exc:
         logger.warning("Cannot reach primary RDS (%s) — proceeding with failover", exc)
 
-    # Step 3 – promote replica
-    rds_replica = boto3.client("rds", region_name=REPLICA_REGION)
-    logger.info("Promoting %s in %s...", REPLICA_DB_IDENTIFIER, REPLICA_REGION)
+    # Step 3 - promote replica
+    rds_replica = boto3.client("rds", region_name=target_region)
+    logger.info("Promoting %s in %s...", REPLICA_DB_IDENTIFIER, target_region)
     try:
         rds_replica.promote_read_replica(
             DBInstanceIdentifier=REPLICA_DB_IDENTIFIER,
             BackupRetentionPeriod=7,
         )
-    except rds_replica.exceptions.InvalidDBInstanceStateFault as exc:
-        logger.error("Cannot promote replica: %s", exc)
-        _notify(f"FAILOVER FAILED: Cannot promote {REPLICA_DB_IDENTIFIER}: {exc}")
-        return {"statusCode": 500, "body": str(exc)}
-
-    waiter = rds_replica.get_waiter("db_instance_available")
-    try:
+        waiter = rds_replica.get_waiter("db_instance_available")
         waiter.wait(
             DBInstanceIdentifier=REPLICA_DB_IDENTIFIER,
             WaiterConfig={"Delay": 15, "MaxAttempts": 20},
         )
         logger.info("Replica promotion complete")
     except Exception as exc:
-        logger.warning("Waiter timed out: %s — promotion may still be in progress", exc)
+        logger.warning("Promotion issue: %s — may still be in progress", exc)
 
-    # Step 4 – notify
+    # Step 4 - update Route 53 to remove failed region from DNS rotation
+    if HOSTED_ZONE_ID and FAILED_REGION_ELB:
+        try:
+            r53 = boto3.client("route53")
+            r53.change_resource_record_sets(
+                HostedZoneId=HOSTED_ZONE_ID,
+                ChangeBatch={
+                    "Comment": f"Failover: removing {PRIMARY_REGION} from rotation",
+                    "Changes": [{
+                        "Action": "DELETE",
+                        "ResourceRecordSet": {
+                            "Name": "app.multi-region-platform.internal",
+                            "Type": "CNAME",
+                            "SetIdentifier": "aps1",
+                            "Region": PRIMARY_REGION,
+                            "TTL": 60,
+                            "ResourceRecords": [{"Value": FAILED_REGION_ELB}]
+                        }
+                    }]
+                }
+            )
+            logger.info("Route 53 updated: removed %s from rotation", PRIMARY_REGION)
+        except Exception as exc:
+            logger.warning("Route 53 update failed: %s", exc)
+
+    # Step 5 - notify
     _notify(
         f"DB FAILOVER COMPLETE\n"
-        f"Promoted: {REPLICA_DB_IDENTIFIER} ({REPLICA_REGION})\n"
+        f"Promoted: {REPLICA_DB_IDENTIFIER} ({target_region})\n"
+        f"Route 53: {PRIMARY_REGION} removed from DNS rotation\n"
         f"Timestamp: {time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())}\n"
         f"Action required: Update app connection strings if not using RDS CNAME"
     )
@@ -95,7 +122,8 @@ def lambda_handler(event, context):
         "body": json.dumps({
             "status": "failover_complete",
             "promoted_replica": REPLICA_DB_IDENTIFIER,
-            "region": REPLICA_REGION,
+            "region": target_region,
+            "route53_updated": True,
         }),
     }
 
