@@ -1,0 +1,46 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: multi-region-app
+  namespace: multi-region
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: multi-region-app
+  template:
+    metadata:
+      labels:
+        app: multi-region-app
+    spec:
+      containers:
+      - name: app
+        image: nginx:alpine
+        ports:
+        - containerPort: 80
+        resources:
+          requests:
+            memory: "64Mi"
+            cpu: "50m"
+          limits:
+            memory: "128Mi"
+            cpu: "100m"
+        readinessProbe:
+          httpGet:
+            path: /
+            port: 80
+          initialDelaySeconds: 5
+          periodSeconds: 10
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: multi-region-app
+  namespace: multi-region
+spec:
+  type: LoadBalancer
+  selector:
+    app: multi-region-app
+  ports:
+  - port: 80
+    targetPort: 80
