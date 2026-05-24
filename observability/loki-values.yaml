@@ -1,0 +1,13 @@
+# loki-values.yaml
+# Deploys Loki for log aggregation; Grafana reads from it via the Loki datasource.
+loki:
+  auth_enabled: false
+  commonConfig:
+    replication_factor: 1
+  storage:
+    type: filesystem
+promtail:
+  enabled: true
+  config:
+    clients:
+      - url: http://loki:3100/loki/api/v1/push
