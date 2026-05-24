@@ -47,7 +47,7 @@ module "eks" {
   version = "20.8.4"
 
   cluster_name                             = "mr-eks-aps1"
-  cluster_version                          = "1.29"
+  cluster_version                          = "1.30"
   enable_cluster_creator_admin_permissions = true
   cluster_endpoint_public_access           = true
 
@@ -59,7 +59,7 @@ module "eks" {
       desired_size   = 2
       max_size       = 3
       min_size       = 1
-      instance_types = ["t3.micro"]
+      instance_types = ["t3.small"]
       ami_type       = "AL2_x86_64"
       tags           = local.common_tags
     }
