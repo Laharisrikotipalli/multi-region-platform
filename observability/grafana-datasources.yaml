@@ -1,27 +1,54 @@
 apiVersion: 1
 datasources:
+  # ── Local region (default) ─────────────────────────────────────────────────
   - name: Prometheus-local
     type: prometheus
     access: proxy
     url: http://prometheus-kube-prometheus-prometheus.monitoring.svc:9090
     isDefault: true
+    jsonData:
+      timeInterval: "15s"
+
   - name: Loki-local
     type: loki
     access: proxy
     url: http://loki.monitoring.svc:3100
-  - name: Jaeger-local
-    type: jaeger
+
+  - name: Tempo-local
+    type: tempo
     access: proxy
-    url: http://jaeger.monitoring.svc:16686
-  - name: Prometheus-aps1
+    url: http://tempo.monitoring.svc:3100
+    jsonData:
+      tracesToLogs:
+        datasourceUid: loki-local
+        tags: ["job", "instance", "pod", "namespace"]
+      serviceMap:
+        datasourceUid: prometheus-local
+
+  # ── Cross-region Prometheus (single-pane-of-glass) ─────────────────────────
+  # These URLs are ELB endpoints created by the Prometheus Helm chart.
+  # Replace with actual ELB hostnames after first deploy, or use Grafana Agent
+  # remote_write to centralise metrics in one region.
+  - name: Prometheus-ap-southeast-1
     type: prometheus
     access: proxy
-    url: http://a75d94efc91794d6690d676b2f64004c-720853056.ap-southeast-1.elb.amazonaws.com
-  - name: Prometheus-euw1
+    url: http://${APS1_PROMETHEUS_ELB:-prometheus-kube-prometheus-prometheus.monitoring.svc:9090}
+    jsonData:
+      timeInterval: "15s"
+      customQueryParameters: "region=ap-southeast-1"
+
+  - name: Prometheus-eu-west-1
     type: prometheus
     access: proxy
-    url: http://aa3c52757566a4b8891761d68327f0eb-282513953.eu-west-1.elb.amazonaws.com
-  - name: Prometheus-use1
+    url: http://${EUW1_PROMETHEUS_ELB:-prometheus-kube-prometheus-prometheus.monitoring.svc:9090}
+    jsonData:
+      timeInterval: "15s"
+      customQueryParameters: "region=eu-west-1"
+
+  - name: Prometheus-us-east-1
     type: prometheus
     access: proxy
-    url: http://ad415091003f8448baded07298a77c2f-2057774029.us-east-1.elb.amazonaws.com
+    url: http://${USE1_PROMETHEUS_ELB:-prometheus-kube-prometheus-prometheus.monitoring.svc:9090}
+    jsonData:
+      timeInterval: "15s"
+      customQueryParameters: "region=us-east-1"

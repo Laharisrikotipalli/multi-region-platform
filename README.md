@@ -1,20 +1,21 @@
 # Multi-Region Platform on AWS
 
-High-availability Kubernetes platform deployed across three AWS regions using Amazon EKS, RDS PostgreSQL, ElastiCache Redis, and Amazon Route 53.
+High-availability Kubernetes platform deployed across three AWS regions using Amazon EKS,
+RDS PostgreSQL, ElastiCache Redis, and Amazon Route 53.
 
 ## Architecture
 
 | Layer | Technology | Details |
 |---|---|---|
 | Compute | Amazon EKS 1.30 | One cluster per region: `ap-southeast-1`, `eu-west-1`, `us-east-1` |
-| Networking | AWS VPC | Each cluster has its own VPC with public/private subnets and NAT gateway |
-| Load Balancing | Kubernetes `Service: LoadBalancer` | Creates an AWS ELB per region automatically |
-| Traffic Management | Amazon Route 53 | Latency-based routing; health checks remove unhealthy regions |
-| Database | Amazon RDS PostgreSQL 15 | Primary in `ap-southeast-1`; read replicas in `eu-west-1` and `us-east-1` |
-| Cache | Amazon ElastiCache Redis | Primary in `ap-southeast-1` joined to a Global Datastore; secondaries in other regions |
-| GitOps | ArgoCD | Installed on every cluster; syncs from this repo |
-| Observability | Prometheus + Grafana + Loki + Tempo | Deployed via Helm on every cluster; single-pane-of-glass via Grafana |
-| DR Automation | AWS Lambda + CloudWatch Alarm | Promotes RDS replica automatically when primary fails |
+| Networking | AWS VPC + NetworkPolicy | Isolated VPC per region; default-deny K8s network policies |
+| Load Balancing | Kubernetes `Service: LoadBalancer` | AWS ELB per region, exposes `/health` for Route 53 |
+| Traffic Management | Amazon Route 53 | Latency-based routing; health checks auto-remove unhealthy regions |
+| Database | Amazon RDS PostgreSQL 15 | Primary in `ap-southeast-1`; async read replicas in other regions |
+| Cache | Amazon ElastiCache Redis | Independent cluster per region |
+| GitOps | ArgoCD | Per-cluster; syncs from this repo — no single point of failure |
+| Observability | Prometheus + Grafana + Loki + Tempo | All clusters; cross-region datasources in Grafana |
+| DR Automation | AWS Lambda + CloudWatch Alarm | Auto-promotes RDS replica + updates Route 53 on failure |
 
 ## Regions
 
@@ -29,10 +30,11 @@ us-east-1       (replica)   VPC 10.2.0.0/16   mr-eks-use1
 ```bash
 export AWS_ACCESS_KEY_ID=...
 export AWS_SECRET_ACCESS_KEY=...
-export GRAFANA_PASSWORD=...          # Grafana admin password — never commit this
-export DATABASE_URL=...              # postgresql://user:pass@host/db
-export REDIS_URL=...                 # redis://host:6379
-export ALERT_EMAIL=ops@example.com
+export GRAFANA_PASSWORD=...            # Grafana admin password
+export DATABASE_URL=...                # postgresql://user:pass@host/db
+export REDIS_URL=...                   # redis://host:6379
+export TF_VAR_db_password=...          # RDS master password (passed to Terraform securely)
+export ALERT_EMAIL=ops@example.com     # SNS failover notification recipient
 ```
 
 ## Deployment
@@ -41,11 +43,29 @@ export ALERT_EMAIL=ops@example.com
 bash scripts/deploy.sh
 ```
 
-The deploy script will:
-1. Run `terraform apply` across all three regions
-2. Install ArgoCD, Prometheus, Loki, Tempo, and the webapp on each cluster
-3. Create the `app-secrets` Kubernetes Secret on each cluster
-4. Wait for all rollouts to complete
+Or use the submission.yml commands directly:
+
+```bash
+# Deploy all infrastructure
+bash -c "$(yq '.commands.deploy.script' submission.yml)"
+
+# Verify health
+bash -c "$(yq '.commands.verify.script' submission.yml)"
+
+# Run failover test
+bash -c "$(yq '.commands.test-failover.script' submission.yml)"
+
+# Tear down
+bash -c "$(yq '.commands.destroy.script' submission.yml)"
+```
+
+The deploy process:
+1. Builds the Lambda deployment package (`lambda/build.sh`)
+2. Creates S3 remote state buckets (idempotent)
+3. Runs `terraform apply` — primary region first, then replicas in parallel
+4. Fetches kubeconfigs for all 3 EKS clusters
+5. Deploys on each cluster: ArgoCD → Prometheus/Grafana/Loki/Tempo → NetworkPolicies → App
+6. Waits for all rollouts to complete
 
 ## Health Check
 
@@ -54,27 +74,69 @@ The `/health` endpoint verifies:
 - Database connectivity (`SELECT 1`)
 - Redis connectivity (`PING`)
 
-Returns `{"status": "ok"}` with HTTP 200 when all pass, or HTTP 503 when any dependency fails. Route 53 uses this to automatically remove unhealthy regions from DNS rotation.
+Returns `{"status":"ok"}` HTTP 200 when all pass, HTTP 503 on any dependency failure.
+Route 53 uses this to automatically remove unhealthy regions from DNS rotation
+(30 s interval, 3 consecutive failures = ~90 s detection time).
 
 ## Failover Test
 
 ```bash
-export ROUTE53_FQDN=app.example.com
 bash scripts/test-failover.sh
 ```
 
-Suspends ArgoCD auto-sync, scales `ap-southeast-1` to zero replicas, and verifies traffic
-reroutes to another region within 120 seconds. Restores aps1 and re-enables auto-sync on completion.
+Suspends ArgoCD auto-sync, scales `ap-southeast-1` to zero replicas, triggers the Lambda
+failover, then verifies traffic continues to flow via `eu-west-1` and `us-east-1`.
+Restores `ap-southeast-1` and re-enables auto-sync on completion.
 
 ## Observability
 
-Grafana dashboards provide a single view of:
-- CPU / memory / pod metrics (Prometheus)
-- Container logs (Loki)
-- Distributed traces (Tempo / OpenTelemetry)
+Every cluster runs Prometheus + Grafana + Loki + Tempo. Grafana is configured with
+cross-region Prometheus datasources so you can query any region from a single dashboard.
 
 Access Grafana:
 ```bash
 kubectl port-forward svc/prometheus-grafana 3000:80 -n monitoring
 ```
-Open `http://localhost:3000` — credentials are set via the `$GRAFANA_PASSWORD` environment variable at deploy time.
+Open `http://localhost:3000` — login: `admin` / `$GRAFANA_PASSWORD`
+
+## Security Notes
+
+- RDS password is never hardcoded — passed via `TF_VAR_db_password` (marked `sensitive = true` in Terraform)
+- All credentials sourced from environment variables, never committed to the repository
+- NetworkPolicy default-deny applied in `multi-region` namespace
+- EKS nodes run in private subnets; only LoadBalancer Services are publicly reachable
+- IAM Lambda role has least-privilege permissions (RDS Describe/Promote, SNS Publish, CloudWatch Logs)
+
+## Repository Structure
+
+```
+.
+├── ARCHITECTURE.md        # Detailed design, diagrams, trade-offs
+├── RUNBOOK.md             # DR procedures: failover, failback, simulation
+├── README.md              # This file
+├── submission.yml         # Automated deploy/verify/test-failover/destroy commands
+├── app/                   # Application source (FastAPI) + Dockerfile
+├── k8s/
+│   ├── app/               # Deployment, Service, app-deployment.yaml
+│   ├── argocd/            # ArgoCD Application manifest
+│   ├── monitoring/        # ServiceMonitor, Jaeger
+│   └── network-policies/  # Default-deny + allow rules
+├── lambda/
+│   ├── handler.py         # DR Lambda function source
+│   ├── build.sh           # Builds failover.zip
+│   └── failover.zip       # Built artifact (generated by build.sh)
+├── observability/         # Helm values for Prometheus, Loki, Tempo; Grafana datasources
+├── scripts/
+│   ├── deploy.sh          # Full deploy script
+│   └── test-failover.sh   # Standalone failover test
+└── terraform/
+    ├── envs/
+    │   ├── ap-southeast-1/  # Primary region (RDS primary, Lambda, Route 53)
+    │   ├── eu-west-1/       # Replica region
+    │   └── us-east-1/       # Replica region
+    └── modules/
+        ├── database/        # RDS + ElastiCache resources
+        ├── lambda/          # Failover Lambda + CloudWatch alarm + SNS
+        ├── network/         # VPC module wrapper
+        └── route53/         # Hosted zone, health checks, latency records
+```

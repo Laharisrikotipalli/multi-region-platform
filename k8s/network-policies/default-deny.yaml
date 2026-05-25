@@ -1,0 +1,11 @@
+# Deny all ingress and egress by default in multi-region namespace
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: default-deny-all
+  namespace: multi-region
+spec:
+  podSelector: {}
+  policyTypes:
+    - Ingress
+    - Egress

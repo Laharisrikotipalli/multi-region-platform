@@ -1,0 +1,36 @@
+# Allow webapp pods to receive traffic from the LoadBalancer / kube-proxy
+# and to reach DNS, RDS (5432), Redis (6379), and Tempo OTLP (4317)
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-webapp
+  namespace: multi-region
+spec:
+  podSelector:
+    matchLabels:
+      app: multi-region-app
+  policyTypes:
+    - Ingress
+    - Egress
+  ingress:
+    - ports:
+        - port: 8000
+  egress:
+    # DNS
+    - ports:
+        - port: 53
+          protocol: UDP
+        - port: 53
+          protocol: TCP
+    # PostgreSQL
+    - ports:
+        - port: 5432
+          protocol: TCP
+    # Redis
+    - ports:
+        - port: 6379
+          protocol: TCP
+    # Tempo OTLP
+    - ports:
+        - port: 4317
+          protocol: TCP

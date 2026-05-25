@@ -1,0 +1,19 @@
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: multi-region-app
+  namespace: argocd
+  annotations:
+spec:
+  project: default
+  source:
+    repoURL: https://github.com/Laharisrikotipalli/multi-region-platform
+    targetRevision: HEAD
+    path: k8s
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: multi-region
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true

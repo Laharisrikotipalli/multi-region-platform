@@ -61,7 +61,7 @@ resource "aws_db_instance" "primary" {
   instance_class          = "db.t3.micro"
   allocated_storage       = 20
   username                = "postgres"
-  password                = "Password123!"
+  password                = var.db_password
   db_name                 = "appdb"
   db_subnet_group_name    = aws_db_subnet_group.rds.name
   vpc_security_group_ids  = [aws_security_group.rds.id]
@@ -139,4 +139,11 @@ output "redis_endpoint" {
 
 output "global_replication_group_id" {
   value = var.is_primary ? aws_elasticache_global_replication_group.global[0].global_replication_group_id : ""
+}
+
+variable "db_password" {
+  description = "Master password for RDS PostgreSQL"
+  type        = string
+  sensitive   = true
+  default     = ""
 }

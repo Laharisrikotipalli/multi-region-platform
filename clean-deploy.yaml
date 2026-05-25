@@ -1,0 +1,66 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: multi-region-app
+  namespace: multi-region
+
+spec:
+  replicas: 2
+
+  selector:
+    matchLabels:
+      app: multi-region-app
+
+  template:
+    metadata:
+      labels:
+        app: multi-region-app
+
+    spec:
+      containers:
+      - name: app
+        image: laharisri/multi-region-app:v3
+
+        ports:
+        - containerPort: 8000
+
+        env:
+        - name: DATABASE_URL
+          valueFrom:
+            secretKeyRef:
+              name: app-secrets
+              key: database-url
+
+        - name: REDIS_URL
+          valueFrom:
+            secretKeyRef:
+              name: app-secrets
+              key: redis-url
+
+        - name: AWS_REGION
+          value: "us-east-1"
+
+        resources:
+          requests:
+            cpu: "100m"
+            memory: "128Mi"
+
+          limits:
+            cpu: "500m"
+            memory: "256Mi"
+
+        readinessProbe:
+          httpGet:
+            path: /health
+            port: 8000
+
+          initialDelaySeconds: 10
+          periodSeconds: 15
+
+        livenessProbe:
+          httpGet:
+            path: /health
+            port: 8000
+
+          initialDelaySeconds: 30
+          periodSeconds: 30
