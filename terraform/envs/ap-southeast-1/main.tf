@@ -9,7 +9,7 @@ terraform {
   }
 
   backend "s3" {
-    bucket = "mr-tfstate-aps1"
+    bucket = "mr-tfstate-aps1-515422922112"
     key    = "ap-southeast-1/terraform.tfstate"
     region = "ap-southeast-1"
   }
@@ -147,6 +147,7 @@ resource "aws_db_instance" "postgres" {
   skip_final_snapshot = true
 
   publicly_accessible = false
+  storage_encrypted   = true
 
   tags = local.common_tags
 }
@@ -292,6 +293,10 @@ variable "use1_elb_zone_id" {
   type    = string
   default = ""
 }
+
+
+
+
 
 output "primary_db_arn" {
   value = aws_db_instance.postgres.arn

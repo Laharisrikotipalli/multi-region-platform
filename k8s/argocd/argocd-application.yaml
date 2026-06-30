@@ -1,15 +1,37 @@
 apiVersion: argoproj.io/v1alpha1
+kind: AppProject
+metadata:
+  name: multi-region-platform
+  namespace: argocd
+spec:
+  description: Multi-Region Kubernetes Platform
+  sourceRepos:
+    - "https://github.com/Laharisrikotipalli/multi-region-platform"
+  destinations:
+    - namespace: multi-region
+      server: https://kubernetes.default.svc
+    - namespace: monitoring
+      server: https://kubernetes.default.svc
+  clusterResourceWhitelist:
+    - group: ""
+      kind: Namespace
+  namespaceResourceWhitelist:
+    - group: "*"
+      kind: "*"
+---
+apiVersion: argoproj.io/v1alpha1
 kind: Application
 metadata:
   name: multi-region-app
   namespace: argocd
-  annotations:
+  finalizers:
+    - resources-finalizer.argocd.argoproj.io
 spec:
-  project: default
+  project: multi-region-platform
   source:
-    repoURL: https://github.com/Laharisrikotipalli/multi-region-platform
+    repoURL: "https://github.com/Laharisrikotipalli/multi-region-platform"
     targetRevision: HEAD
-    path: k8s
+    path: k8s/app
   destination:
     server: https://kubernetes.default.svc
     namespace: multi-region
@@ -17,3 +39,12 @@ spec:
     automated:
       prune: true
       selfHeal: true
+      allowEmpty: false
+    syncOptions:
+      - CreateNamespace=true
+    retry:
+      limit: 3
+      backoff:
+        duration: 5s
+        factor: 2
+        maxDuration: 1m

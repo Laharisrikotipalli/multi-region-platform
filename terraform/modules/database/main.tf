@@ -147,3 +147,22 @@ variable "db_password" {
   sensitive   = true
   default     = ""
 }
+
+# CloudWatch alarm for replication lag monitoring (RPO < 30s)
+resource "aws_cloudwatch_metric_alarm" "replication_lag" {
+  count               = var.is_primary ? 0 : 1
+  alarm_name          = "${var.name_prefix}-replica-lag"
+  comparison_operator = "GreaterThanThreshold"
+  evaluation_periods  = 2
+  metric_name         = "ReplicaLag"
+  namespace           = "AWS/RDS"
+  period              = 60
+  statistic           = "Average"
+  threshold           = 30
+  alarm_description   = "RDS replication lag > 30s — RPO at risk"
+  treat_missing_data  = "breaching"
+  tags                = var.tags
+  dimensions = {
+    DBInstanceIdentifier = "${var.name_prefix}-postgres-replica"
+  }
+}

@@ -16,13 +16,11 @@ from opentelemetry.sdk.trace import TracerProvider
 from opentelemetry.sdk.trace.export import BatchSpanProcessor
 from prometheus_fastapi_instrumentator import Instrumentator
 
-# ── Environment ───────────────────────────────────────────────────────────────
-DATABASE_URL  = os.environ["DATABASE_URL"]   # postgresql://user:pass@host/db
-REDIS_URL     = os.environ["REDIS_URL"]      # redis://host:6379
+DATABASE_URL  = os.environ["DATABASE_URL"]  
+REDIS_URL     = os.environ["REDIS_URL"]      
 REGION        = os.getenv("AWS_REGION", "unknown")
 OTLP_ENDPOINT = os.getenv("OTLP_ENDPOINT", "http://tempo.monitoring.svc.cluster.local:4317")
 
-# ── OpenTelemetry tracing ─────────────────────────────────────────────────────
 provider = TracerProvider()
 provider.add_span_processor(
     BatchSpanProcessor(OTLPSpanExporter(endpoint=OTLP_ENDPOINT, insecure=True))
@@ -33,13 +31,10 @@ tracer = trace.get_tracer(__name__)
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # ── Startup ───────────────────────────────────────────────────────────────
+
     app.state.db    = await asyncpg.create_pool(DATABASE_URL, min_size=1, max_size=5)
     app.state.redis = aioredis.from_url(REDIS_URL, decode_responses=True)
 
-    # ── Graceful SIGTERM handler (Kubernetes sends SIGTERM before SIGKILL) ────
-    # Ensures the connection pool is closed cleanly even when the container is
-    # terminated by the kubelet, preventing connection leaks on the DB side.
     loop = asyncio.get_event_loop()
 
     def _handle_sigterm():
@@ -48,8 +43,6 @@ async def lifespan(app: FastAPI):
     loop.add_signal_handler(signal.SIGTERM, _handle_sigterm)
 
     yield
-
-    # ── Shutdown (normal path: SIGINT / uvicorn reload) ───────────────────────
     await _shutdown(app)
 
 
@@ -68,8 +61,6 @@ Instrumentator().instrument(app).expose(app)
 FastAPIInstrumentor.instrument_app(app)
 
 
-# ── Routes ────────────────────────────────────────────────────────────────────
-
 @app.get("/")
 async def root():
     return {
@@ -81,14 +72,6 @@ async def root():
 
 @app.get("/health")
 async def health(response: Response):
-    """
-    Deep health check – verifies the web service, database connectivity,
-    and Redis connectivity.
-
-    Returns {"status": "ok"} with HTTP 200 when all checks pass.
-    Returns {"status": "degraded"} with HTTP 503 if any dependency fails,
-    causing Route 53 to remove this region from DNS rotation.
-    """
     with tracer.start_as_current_span("health_check"):
         result = {
             "status": "ok",
@@ -98,7 +81,6 @@ async def health(response: Response):
         }
         errors = []
 
-        # ── Database connectivity ─────────────────────────────────────────
         try:
             async with app.state.db.acquire() as conn:
                 await asyncio.wait_for(conn.execute("SELECT 1"), timeout=3.0)
@@ -107,7 +89,6 @@ async def health(response: Response):
             result["checks"]["database"] = f"error: {exc}"
             errors.append(f"database: {exc}")
 
-        # ── Redis connectivity ────────────────────────────────────────────
         try:
             pong = await asyncio.wait_for(app.state.redis.ping(), timeout=3.0)
             result["checks"]["redis"] = "ok" if pong else "no-response"
@@ -131,7 +112,6 @@ async def info():
 
 @app.get("/data")
 async def data():
-    """Read from PostgreSQL, serve from Redis cache when available."""
     cache_key = f"data:{REGION}"
     cached = await app.state.redis.get(cache_key)
     if cached:

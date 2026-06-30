@@ -1,16 +1,3 @@
-"""
-Lambda: multi-region-failover
-Triggered by CloudWatch Alarm when primary RDS becomes unhealthy.
-Steps:
-  1. Parse CloudWatch alarm from SNS event
-  2. Verify primary RDS is truly unavailable (avoid false positives)
-  3. Promote eu-west-1 read replica to standalone primary
-  4. Update Route 53 to remove failed region from DNS rotation
-  5. Notify ops team via SNS
-
-RTO target: < 5 minutes. RPO target: < 30 seconds (async replication lag).
-"""
-
 import json
 import logging
 import os
