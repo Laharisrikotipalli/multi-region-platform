@@ -80,7 +80,7 @@ for KC in /tmp/kc-aps1 /tmp/kc-euw1 /tmp/kc-use1; do
     --from-literal=database-url="postgresql://postgres:${DB_PASSWORD}@${NEW_DB_HOST}/appdb" \
     --from-literal=redis-url="${REDIS_URL}" \
     --dry-run=client -o yaml | KUBECONFIG=$KC kubectl apply -f -
-  KUBECONFIG=$KC kubectl rollout restart deployment/multi-region-app -n multi-region
+  KUBECONFIG=$KC kubectl rollout restart deployment/webapp -n multi-region
 done
 ```
 
@@ -108,8 +108,7 @@ kubectl patch application multi-region-app -n argocd \
 
 **Step 3** — Scale down aps1 webapp to simulate failure:
 ```bash
-kubectl scale deployment webapp           -n multi-region --replicas=0
-kubectl scale deployment multi-region-app -n multi-region --replicas=0
+kubectl scale deployment webapp -n multi-region --replicas=0
 ```
 
 **Step 4** — Trigger Lambda failover:
@@ -137,10 +136,8 @@ done
 **Step 6** — Restore aps1 and re-enable ArgoCD:
 ```bash
 export KUBECONFIG=/tmp/kc-aps1
-kubectl scale deployment webapp           -n multi-region --replicas=3
-kubectl scale deployment multi-region-app -n multi-region --replicas=3
-kubectl rollout status deployment/webapp            -n multi-region --timeout=3m
-kubectl rollout status deployment/multi-region-app  -n multi-region --timeout=3m
+kubectl scale deployment webapp -n multi-region --replicas=3
+kubectl rollout status deployment/webapp -n multi-region --timeout=3m
 
 kubectl patch application multi-region-app -n argocd \
   --type=merge -p '{"spec":{"syncPolicy":{"automated":{"prune":true,"selfHeal":true}}}}'
