@@ -1,23 +1,3 @@
-apiVersion: v1
-kind: ConfigMap
-metadata:
-  name: nginx-health-config
-  namespace: multi-region
-data:
-  default.conf: |
-    server {
-        listen 80;
-        location /health {
-            access_log off;
-            return 200 '{"status":"ok"}';
-            add_header Content-Type application/json;
-        }
-        location / {
-            root /usr/share/nginx/html;
-            index index.html;
-        }
-    }
----
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -45,39 +25,50 @@ spec:
           matchLabels:
             app: webapp
       containers:
-      - name: nginx
-        image: nginx:alpine
+      - name: app
+        image: laharisri/multi-region-app:v3
         ports:
-        - containerPort: 80
-        volumeMounts:
-        - name: nginx-config
-          mountPath: /etc/nginx/conf.d/default.conf
-          subPath: default.conf
+        - containerPort: 8000
+        env:
+        - name: DATABASE_URL
+          valueFrom:
+            secretKeyRef:
+              name: app-secrets
+              key: database-url
+        - name: REDIS_URL
+          valueFrom:
+            secretKeyRef:
+              name: app-secrets
+              key: redis-url
+        - name: AWS_REGION
+          # Per-cluster ConfigMap created by scripts/deploy.sh / submission.yml at deploy
+          # time (one per region) — NOT hardcoded, since this same manifest is applied
+          # identically to all three regional clusters via ArgoCD.
+          valueFrom:
+            configMapKeyRef:
+              name: cluster-config
+              key: aws-region
         resources:
           requests:
-            memory: "64Mi"
-            cpu: "50m"
-          limits:
             memory: "128Mi"
             cpu: "100m"
+          limits:
+            memory: "256Mi"
+            cpu: "500m"
         readinessProbe:
           httpGet:
             path: /health
-            port: 80
-          initialDelaySeconds: 5
-          periodSeconds: 10
+            port: 8000
+          initialDelaySeconds: 10
+          periodSeconds: 15
           failureThreshold: 3
         livenessProbe:
           httpGet:
             path: /health
-            port: 80
-          initialDelaySeconds: 10
-          periodSeconds: 20
+            port: 8000
+          initialDelaySeconds: 30
+          periodSeconds: 30
           failureThreshold: 3
-      volumes:
-      - name: nginx-config
-        configMap:
-          name: nginx-health-config
 ---
 apiVersion: v1
 kind: Service
@@ -90,4 +81,4 @@ spec:
     app: webapp
   ports:
   - port: 80
-    targetPort: 80
+    targetPort: 8000

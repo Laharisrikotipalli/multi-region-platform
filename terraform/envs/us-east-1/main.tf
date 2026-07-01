@@ -175,6 +175,10 @@ output "rds_replica_endpoint" {
   sensitive = true
 }
 
+output "db_endpoint" {
+  value = aws_db_instance.postgres_replica.address
+}
+
 output "redis_endpoint" {
   value = aws_elasticache_replication_group.redis.primary_endpoint_address
 }

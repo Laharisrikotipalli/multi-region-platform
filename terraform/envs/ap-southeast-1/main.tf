@@ -302,6 +302,14 @@ output "primary_db_arn" {
   value = aws_db_instance.postgres.arn
 }
 
+output "db_endpoint" {
+  value = aws_db_instance.postgres.address
+}
+
+output "redis_endpoint" {
+  value = aws_elasticache_replication_group.redis.primary_endpoint_address
+}
+
 output "global_replication_group_id" {
   value = aws_elasticache_replication_group.redis.id
 }

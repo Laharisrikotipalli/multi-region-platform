@@ -18,7 +18,7 @@ PRE=$(curl -sS --max-time 10 "https://${ROUTE53_FQDN}/health" \
 [[ "$PRE" == "ok" ]] && ok "Pre-failover: platform healthy" || fail "Pre-failover health check failed"
 
 log "=== Simulating ap-southeast-1 failure (scale to 0) ==="
-KUBECONFIG=/tmp/kc-aps1 kubectl scale deployment multi-region-app --replicas=0 -n multi-region
+KUBECONFIG=/tmp/kc-aps1 kubectl scale deployment webapp --replicas=0 -n multi-region
 log "Waiting for Route 53 to reroute (up to 120s)..."
 
 ELAPSED=0; REROUTED=false
@@ -39,8 +39,8 @@ done
 
 # Always restore ap-southeast-1
 log "=== Restoring ap-southeast-1 ==="
-KUBECONFIG=/tmp/kc-aps1 kubectl scale deployment multi-region-app --replicas=3 -n multi-region
-KUBECONFIG=/tmp/kc-aps1 kubectl rollout status deployment/multi-region-app -n multi-region --timeout=120s
+KUBECONFIG=/tmp/kc-aps1 kubectl scale deployment webapp --replicas=3 -n multi-region
+KUBECONFIG=/tmp/kc-aps1 kubectl rollout status deployment/webapp -n multi-region --timeout=120s
 ok "ap-southeast-1 restored"
 
 [[ "$REROUTED" != "true" ]] && fail "Traffic not rerouted within 120s"

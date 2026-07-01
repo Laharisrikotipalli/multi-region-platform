@@ -138,7 +138,7 @@ document can be audited line-by-line against the code.
 | Robust endpoint health checks | ✅ Done | `app/main.py` `/health` — checks Postgres + Redis, returns 503 on failure |
 | Stateless app deployed to all clusters | ✅ Done | `k8s/app/deployment.yaml` |
 | GitOps controller (ArgoCD) synced from central repo | ✅ Done | `k8s/argocd/argocd-application.yaml` |
-| PostgreSQL per region + cross-region replication | ✅ Done | `terraform/modules/database/main.tf` (`replicate_source_db`) |
+| PostgreSQL per region + cross-region replication | ✅ Done | `terraform/envs/*/main.tf` (`aws_db_instance.postgres` / `.postgres_replica`, via `replicate_source_db` + `terraform_remote_state`) |
 | Replication lag monitored | ✅ Done | `RDSReplicationLagHigh` alert + `aws_cloudwatch_metric_alarm.replication_lag` |
 | Redis per region + cross-region replication | ✅ Done | `aws_elasticache_global_replication_group` |
 | Federated monitoring / unified dashboard | ⚠️ Partial | Per-cluster Prometheus + Grafana cross-region datasources deployed; central long-term store (Mimir/Cortex via remote-write) is scaffolded, not yet deployed |
@@ -147,31 +147,42 @@ document can be audited line-by-line against the code.
 | Automated DR runbook/scripts | ✅ Done | `lambda/lambda_function.py`, `lambda/handler.py`, `RUNBOOK.md` |
 | RTO/RPO defined and justified | ✅ Done | RTO < 5 min, RPO < 30 s (see Disaster Recovery section above) |
 | Survive full regional shutdown | ✅ Done | Demonstrated via `scripts/test-failover.sh` |
-| Network security policies | ✅ Done | Security groups (`terraform/modules/database/main.tf`) + `k8s/network-policies/` |
+| Network security policies | ✅ Done | Security groups (`terraform/envs/*/main.tf`) + `k8s/network-policies/` |
 | Consistent resource tagging | ✅ Done | `local.common_tags` applied to every resource across all three env files |
 
 ## Known Limitations / Next Steps
 
 Documented here deliberately, rather than glossed over, to keep this doc aligned with the code:
 
-1. **Route 53 cleanup in Lambda is broken against real infra.** `lambda_function.py` issues a
-   `DELETE` for a `CNAME` record with `SetIdentifier="aps1"`, but Terraform provisions **alias `A`
-   records** with `SetIdentifier="ap-southeast-1"` (see `terraform/modules/route53/main.tf`). The
-   call will fail silently (caught by a broad `except`) — DB promotion and the SNS alert still
-   happen, but the Lambda's own DNS-removal step does not. In practice this doesn't break failover,
-   because the Route 53 **health check** (not the Lambda) is what actually pulls the region out of
-   rotation once `/health` starts returning 503 — but the Lambda step should still be fixed to match
-   the real record type/identifier.
-2. **Federated metrics store not deployed.** See Observability section above — `remoteWrite` is
+1. **Federated metrics store not deployed.** See Observability section above — `remoteWrite` is
    configured but points at a placeholder; no Mimir/Cortex/Thanos receiver exists in this repo yet.
-3. **Redis has no automated cross-region failover.** Global Datastore replication is configured,
+2. **Redis has no automated cross-region failover.** Global Datastore replication is configured,
    but nothing promotes a secondary automatically if the primary region's Redis becomes
    unreachable — the app degrades to cache-miss/DB reads in that case, which is acceptable given
    Redis here is a cache (not a system of record), but is not "automated Redis failover."
-4. **Hardcoded fallback values in `lambda_function.py`** (`HOSTED_ZONE_ID`, `FAILED_REGION_ELB`)
-   are environment-specific defaults left in for local testing convenience. They're overridable via
-   env vars at deploy time (`submission.yml` sets `HOSTED_ZONE_ID` dynamically), but should be
-   removed or clearly marked placeholder before this is treated as reusable across AWS accounts.
+3. **`terraform/modules/database/` and `terraform/modules/network/` were removed.** They were
+   leftover scaffolding from an earlier design that none of the three `terraform/envs/*/main.tf`
+   files ever actually called — each env provisions its RDS/ElastiCache/security-group resources
+   inline, and VPCs come from the public `terraform-aws-modules/vpc/aws` registry module instead.
+   Keeping unused modules around risked exactly the kind of doc/code mismatch this section exists
+   to prevent, so they were deleted rather than left to rot.
+4. **`k8s/app/deployment.yaml` previously deployed a placeholder nginx container** with a static
+   `/health` response, while the real FastAPI app (with genuine Postgres/Redis health checks,
+   OpenTelemetry tracing, and Prometheus metrics) sat unused in a root-level `clean-deploy.yaml`.
+   This has been fixed: `k8s/app/deployment.yaml` now deploys the real app
+   (`laharisri/multi-region-app:v3`) under the same `webapp` Deployment/Service names everything
+   else (Route 53, the Lambda, `RUNBOOK.md`, `submission.yml`) already expects, and the orphaned
+   `clean-deploy.yaml` was removed.
+5. **`app-secrets` (DATABASE_URL/REDIS_URL) and `cluster-config` (AWS_REGION) are now created
+   automatically** by both `scripts/deploy.sh` and `submission.yml`'s `deploy` step, immediately
+   before ArgoCD syncs the app — pulled from real Terraform outputs (`db_endpoint`, `redis_endpoint`)
+   plus `TF_VAR_db_password`, per region. Previously these were referenced in `RUNBOOK.md` but never
+   actually created anywhere, which would have caused the app to crash-loop on first deploy.
+6. **`submission.yml` previously never bootstrapped its own Terraform state buckets** and referenced
+   a non-existent output (`rds_arn` instead of the real `primary_db_arn`), masked by a silent
+   fallback. Both are fixed: the bucket bootstrap loop now matches `scripts/deploy.sh` exactly, and
+   the dead output reference was removed (replica regions already pull the primary's DB ARN via
+   `terraform_remote_state`, not a passed `-var`).
 
 ## Security
 

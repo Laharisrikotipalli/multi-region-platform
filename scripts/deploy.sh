@@ -45,14 +45,32 @@ aws eks update-kubeconfig --region eu-west-1      --name mr-eks-euw1 --kubeconfi
 aws eks update-kubeconfig --region us-east-1      --name mr-eks-use1 --kubeconfig /tmp/kc-use1
 
 # ── 5. Install ArgoCD and deploy application on each cluster ──────────────────
-for pair in "aps1:/tmp/kc-aps1" "euw1:/tmp/kc-euw1" "use1:/tmp/kc-use1"; do
-  region="${pair%%:*}"; kc="${pair##*:}"
+for pair in "aps1:/tmp/kc-aps1:ap-southeast-1" "euw1:/tmp/kc-euw1:eu-west-1" "use1:/tmp/kc-use1:us-east-1"; do
+  short="${pair%%:*}"; rest="${pair#*:}"; kc="${rest%%:*}"; region="${rest#*:}"
   log "==> Bootstrapping ArgoCD on $region..."
   export KUBECONFIG="$kc"
   kubectl create namespace argocd --dry-run=client -o yaml | kubectl apply -f -
   kubectl apply -n argocd -f https://raw.githubusercontent.com/argoproj/argo-cd/stable/manifests/install.yaml
   kubectl rollout status deployment/argocd-server -n argocd --timeout=300s
   kubectl apply -f k8s/namespace.yaml
+
+  # ── app-secrets + cluster-config must exist BEFORE ArgoCD syncs the app, ────
+  # ── otherwise the pods crash-loop on missing DATABASE_URL/REDIS_URL. ────────
+  log "==> Fetching DB/Redis endpoints for $region from Terraform state..."
+  DB_ENDPOINT=$(cd "terraform/envs/$region" && terraform output -raw db_endpoint)
+  REDIS_ENDPOINT=$(cd "terraform/envs/$region" && terraform output -raw redis_endpoint)
+  DATABASE_URL="postgresql://postgres:${TF_VAR_db_password}@${DB_ENDPOINT}:5432/appdb"
+  REDIS_URL="redis://${REDIS_ENDPOINT}:6379"
+
+  kubectl create secret generic app-secrets -n multi-region \
+    --from-literal=database-url="$DATABASE_URL" \
+    --from-literal=redis-url="$REDIS_URL" \
+    --dry-run=client -o yaml | kubectl apply -f -
+
+  kubectl create configmap cluster-config -n multi-region \
+    --from-literal=aws-region="$region" \
+    --dry-run=client -o yaml | kubectl apply -f -
+
   kubectl apply -f k8s/argocd-application.yaml
 done
 

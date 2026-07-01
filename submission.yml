@@ -10,6 +10,16 @@ commands:
       : "${TF_VAR_alert_email:?TF_VAR_alert_email is required}"
       export AWS_DEFAULT_REGION=ap-southeast-1
 
+      # ── bootstrap S3 state buckets (must match backend blocks in each main.tf) ──
+      echo "=== Bootstrapping Terraform state buckets ==="
+      for pair in "ap-southeast-1:mr-tfstate-aps1-515422922112" "eu-west-1:mr-tfstate-euw1-515422922112" "us-east-1:mr-tfstate-use1-515422922112"; do
+        region="${pair%%:*}"; bucket="${pair##*:}"
+        aws s3api create-bucket --bucket "$bucket" --region "$region" \
+          $([[ "$region" != "us-east-1" ]] && echo "--create-bucket-configuration LocationConstraint=$region") \
+          2>/dev/null || true
+        aws s3api put-bucket-versioning --bucket "$bucket" --versioning-configuration Status=Enabled
+      done
+
       # ── build Lambda zip ──────────────────────────────────────────────────
       echo "=== Building Lambda zip ==="
       cd lambda
@@ -22,16 +32,13 @@ commands:
       cd terraform/envs/ap-southeast-1
       terraform init -input=false -reconfigure
       terraform apply -auto-approve -input=false
-      PRIMARY_DB_ARN=$(terraform output -raw rds_arn 2>/dev/null || echo "")
       cd ../../..
 
-      # ── terraform: replica regions ────────────────────────────────────────
+      # ── terraform: replica regions (pull primary DB ARN via terraform_remote_state) ──
       for env in eu-west-1 us-east-1; do
         echo "=== Terraform: $env ==="
         cd terraform/envs/$env
         terraform init -input=false -reconfigure
-        terraform apply -auto-approve -input=false \
-          -var="primary_db_arn=${PRIMARY_DB_ARN}" 2>/dev/null || \
         terraform apply -auto-approve -input=false
         cd ../../..
       done
@@ -59,6 +66,23 @@ commands:
         kubectl create namespace monitoring   --dry-run=client -o yaml | kubectl apply -f -
         kubectl create namespace multi-region --dry-run=client -o yaml | kubectl apply -f -
 
+        # ── app-secrets + cluster-config must exist BEFORE ArgoCD syncs the app ────
+        # ── (pods crash-loop without DATABASE_URL/REDIS_URL) ────────────────────────
+        echo "=== Fetching DB/Redis endpoints for $CLUSTER_REGION ==="
+        DB_ENDPOINT=$(cd "terraform/envs/$CLUSTER_REGION" && terraform output -raw db_endpoint)
+        REDIS_ENDPOINT=$(cd "terraform/envs/$CLUSTER_REGION" && terraform output -raw redis_endpoint)
+        DATABASE_URL="postgresql://postgres:${TF_VAR_db_password}@${DB_ENDPOINT}:5432/appdb"
+        REDIS_URL="redis://${REDIS_ENDPOINT}:6379"
+
+        kubectl create secret generic app-secrets -n multi-region \
+          --from-literal=database-url="$DATABASE_URL" \
+          --from-literal=redis-url="$REDIS_URL" \
+          --dry-run=client -o yaml | kubectl apply -f -
+
+        kubectl create configmap cluster-config -n multi-region \
+          --from-literal=aws-region="$CLUSTER_REGION" \
+          --dry-run=client -o yaml | kubectl apply -f -
+
         # ArgoCD
         kubectl apply -n argocd \
           -f https://raw.githubusercontent.com/argoproj/argo-cd/stable/manifests/install.yaml
@@ -66,7 +90,7 @@ commands:
         kubectl rollout status deployment/argocd-server -n argocd --timeout=300s
         kubectl apply -f k8s/argocd-application.yaml
 
-        # Webapp (nginx with /health endpoint)
+        # Webapp (real FastAPI app — /health checks Postgres + Redis)
         kubectl apply -f k8s/app/deployment.yaml
         kubectl rollout status deployment/webapp -n multi-region --timeout=3m
 
