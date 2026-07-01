@@ -4,12 +4,19 @@ set -euo pipefail
 
 : "${AWS_ACCESS_KEY_ID:?Set AWS_ACCESS_KEY_ID}"
 : "${AWS_SECRET_ACCESS_KEY:?Set AWS_SECRET_ACCESS_KEY}"
-: "${ALERT_EMAIL:?Set ALERT_EMAIL}"
+: "${TF_VAR_alert_email:?Set TF_VAR_alert_email}"
+: "${GRAFANA_PASSWORD:?Set GRAFANA_PASSWORD}"
 
 log()  { echo "[$(date '+%H:%M:%S')] $*"; }
 
 # ── 1. Bootstrap S3 state buckets ─────────────────────────────────────────────
-for pair in "ap-southeast-1:mr-tfstate-aps1" "eu-west-1:mr-tfstate-euw1" "us-east-1:mr-tfstate-use1"; do
+# NOTE: these bucket names must exactly match the `backend "s3" { bucket = ... }` block in
+# each terraform/envs/*/main.tf file. Terraform backend blocks can't use variables/interpolation,
+# so if you ever fork this into a different AWS account, update BOTH this list and all three
+# backend blocks to use your own account ID (S3 bucket names are globally unique across all
+# AWS accounts — a name without an account-specific suffix will very likely collide with someone
+# else's bucket and fail with AccessDenied/AllAccessDisabled).
+for pair in "ap-southeast-1:mr-tfstate-aps1-515422922112" "eu-west-1:mr-tfstate-euw1-515422922112" "us-east-1:mr-tfstate-use1-515422922112"; do
   region="${pair%%:*}"; bucket="${pair##*:}"
   log "Creating state bucket $bucket in $region..."
   aws s3api create-bucket --bucket "$bucket" --region "$region" \
@@ -22,7 +29,7 @@ done
 log "==> Deploying ap-southeast-1 (primary)..."
 cd terraform/envs/ap-southeast-1
 terraform init -upgrade
-terraform apply -auto-approve -var="alert_email=${ALERT_EMAIL}"
+terraform apply -auto-approve
 cd ../../..
 
 # ── 3. Deploy replica regions in parallel ─────────────────────────────────────
@@ -61,9 +68,9 @@ for pair in "aps1:/tmp/kc-aps1" "euw1:/tmp/kc-euw1" "use1:/tmp/kc-use1"; do
   kubectl create namespace monitoring --dry-run=client -o yaml | kubectl apply -f -
 
   AWS_REGION="$region" \
-  GRAFANA_ADMIN_PASSWORD="${GRAFANA_ADMIN_PASSWORD:-Admin@123}" \
-  ONCALL_EMAIL="$ALERT_EMAIL" \
-  PROMETHEUS_REMOTE_WRITE_URL="${PROMETHEUS_REMOTE_WRITE_URL:-http://localhost}" \
+  GRAFANA_PASSWORD="${GRAFANA_PASSWORD}" \
+  ONCALL_EMAIL="${TF_VAR_alert_email}" \
+  PROMETHEUS_REMOTE_WRITE_URL="${PROMETHEUS_REMOTE_WRITE_URL:-http://localhost:9090/api/v1/write}" \
     envsubst < observability/prometheus-values.yaml > /tmp/prom-values.yaml
   helm upgrade --install prometheus prometheus-community/kube-prometheus-stack \
     -n monitoring --values /tmp/prom-values.yaml --wait --timeout 10m

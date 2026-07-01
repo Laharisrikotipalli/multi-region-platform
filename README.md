@@ -34,7 +34,7 @@ export GRAFANA_PASSWORD=...            # Grafana admin password
 export DATABASE_URL=...                # postgresql://user:pass@host/db
 export REDIS_URL=...                   # redis://host:6379
 export TF_VAR_db_password=...          # RDS master password (passed to Terraform securely)
-export ALERT_EMAIL=ops@example.com     # SNS failover notification recipient
+export TF_VAR_alert_email=ops@example.com  # SNS + Alertmanager failover notification recipient
 ```
 
 ## Deployment

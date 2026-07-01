@@ -50,11 +50,19 @@ rotation — no manual intervention required.
 - Syncs from `k8s/` directory in this repository
 
 ### Observability — Prometheus + Grafana + Loki + Tempo
-- `kube-prometheus-stack` deployed on every cluster via Helm
+- `kube-prometheus-stack` deployed on every cluster via Helm (`observability/prometheus-values.yaml`)
 - Loki for log aggregation, Tempo for distributed traces (OTLP on port 4317)
-- Grafana configured with **cross-region datasources** pointing at all 3 Prometheus instances
-  for a single-pane-of-glass view of metrics, logs, and traces
-- All three Prometheus endpoints are registered as named datasources in Grafana
+- **Federated view today:** each region runs its own Prometheus; Grafana is pre-provisioned
+  (`observability/grafana-datasources.yaml`) with all three Prometheus instances registered as
+  named datasources, giving a single dashboard that can query metrics from any region —
+  this is the federation mechanism actually deployed and demonstrated in the video walkthrough.
+- **Scaffolded, not yet live:** `prometheus-values.yaml` also configures `remoteWrite` to a
+  `PROMETHEUS_REMOTE_WRITE_URL` placeholder. No Thanos/Cortex/Mimir receiver is deployed in this
+  repo yet, so long-term centralized storage of metrics is **not** functional out of the box —
+  set that env var to a real remote-write endpoint (e.g. a Mimir or Cortex instance) to activate it.
+  Tracked as a follow-up, not claimed as complete.
+- Alerting rules for replication lag (`RDSReplicationLagHigh`, `RedisReplicationDown`) are wired
+  to Alertmanager → email, on every regional Prometheus.
 
 ### Networking
 - Independent VPC per region (10.0.0.0/16, 10.1.0.0/16, 10.2.0.0/16) — no VPC peering required
@@ -111,11 +119,59 @@ Returns `{"status":"ok"}` HTTP 200 when all pass, HTTP 503 when any dependency f
 | DB replication | Async (streaming) | Lower write latency vs small RPO risk (~seconds of data loss on hard crash) |
 | Node size | t3.small | Cost-optimised (~$0.023/hr) vs limited pod density (11 pods/node) |
 | ArgoCD | Per-cluster | Higher resilience (no single GitOps control plane to fail) vs central management |
-| Prometheus | Per-cluster | Data locality / no cross-region query latency vs federation complexity |
+| Prometheus | Per-cluster + Grafana federated view | Data locality / no cross-region query latency vs no single long-term global store (remote-write to Mimir/Cortex scaffolded but not deployed) |
 | Topology spread | `ScheduleAnyway` | Availability on 2-node clusters vs strict spread enforcement (which would cause Pending) |
 | VPC design | Isolated per region | Simplicity / no cross-region blast radius vs no direct inter-region private connectivity |
 | Redis failover | Independent clusters | Fast local cache availability vs possible cache cold-start after failover |
 | Route 53 | Latency-based + health checks | True geo-routing + automatic failover vs higher TTL propagation time (~90 s) |
+
+## Requirements Coverage
+
+Explicit mapping from the task's core requirements to where each is implemented, so this
+document can be audited line-by-line against the code.
+
+| Requirement | Status | Where |
+|---|---|---|
+| K8s clusters in 3+ regions via IaC | ✅ Done | `terraform/envs/{ap-southeast-1,eu-west-1,us-east-1}/main.tf` |
+| Identical core components per cluster | ✅ Done | Same Helm charts / manifests applied in every env |
+| Global load balancing, latency-based DNS, health-check failover | ✅ Done | `terraform/modules/route53/main.tf` |
+| Robust endpoint health checks | ✅ Done | `app/main.py` `/health` — checks Postgres + Redis, returns 503 on failure |
+| Stateless app deployed to all clusters | ✅ Done | `k8s/app/deployment.yaml` |
+| GitOps controller (ArgoCD) synced from central repo | ✅ Done | `k8s/argocd/argocd-application.yaml` |
+| PostgreSQL per region + cross-region replication | ✅ Done | `terraform/modules/database/main.tf` (`replicate_source_db`) |
+| Replication lag monitored | ✅ Done | `RDSReplicationLagHigh` alert + `aws_cloudwatch_metric_alarm.replication_lag` |
+| Redis per region + cross-region replication | ✅ Done | `aws_elasticache_global_replication_group` |
+| Federated monitoring / unified dashboard | ⚠️ Partial | Per-cluster Prometheus + Grafana cross-region datasources deployed; central long-term store (Mimir/Cortex via remote-write) is scaffolded, not yet deployed |
+| Centralized logging | ✅ Done | Loki per cluster (`observability/loki-values.yaml`), queried via Grafana |
+| Distributed tracing across regions | ✅ Done | Tempo + OTLP instrumentation in `app/main.py`, `k8s/monitoring/jaeger.yaml` |
+| Automated DR runbook/scripts | ✅ Done | `lambda/lambda_function.py`, `lambda/handler.py`, `RUNBOOK.md` |
+| RTO/RPO defined and justified | ✅ Done | RTO < 5 min, RPO < 30 s (see Disaster Recovery section above) |
+| Survive full regional shutdown | ✅ Done | Demonstrated via `scripts/test-failover.sh` |
+| Network security policies | ✅ Done | Security groups (`terraform/modules/database/main.tf`) + `k8s/network-policies/` |
+| Consistent resource tagging | ✅ Done | `local.common_tags` applied to every resource across all three env files |
+
+## Known Limitations / Next Steps
+
+Documented here deliberately, rather than glossed over, to keep this doc aligned with the code:
+
+1. **Route 53 cleanup in Lambda is broken against real infra.** `lambda_function.py` issues a
+   `DELETE` for a `CNAME` record with `SetIdentifier="aps1"`, but Terraform provisions **alias `A`
+   records** with `SetIdentifier="ap-southeast-1"` (see `terraform/modules/route53/main.tf`). The
+   call will fail silently (caught by a broad `except`) — DB promotion and the SNS alert still
+   happen, but the Lambda's own DNS-removal step does not. In practice this doesn't break failover,
+   because the Route 53 **health check** (not the Lambda) is what actually pulls the region out of
+   rotation once `/health` starts returning 503 — but the Lambda step should still be fixed to match
+   the real record type/identifier.
+2. **Federated metrics store not deployed.** See Observability section above — `remoteWrite` is
+   configured but points at a placeholder; no Mimir/Cortex/Thanos receiver exists in this repo yet.
+3. **Redis has no automated cross-region failover.** Global Datastore replication is configured,
+   but nothing promotes a secondary automatically if the primary region's Redis becomes
+   unreachable — the app degrades to cache-miss/DB reads in that case, which is acceptable given
+   Redis here is a cache (not a system of record), but is not "automated Redis failover."
+4. **Hardcoded fallback values in `lambda_function.py`** (`HOSTED_ZONE_ID`, `FAILED_REGION_ELB`)
+   are environment-specific defaults left in for local testing convenience. They're overridable via
+   env vars at deploy time (`submission.yml` sets `HOSTED_ZONE_ID` dynamically), but should be
+   removed or clearly marked placeholder before this is treated as reusable across AWS accounts.
 
 ## Security
 

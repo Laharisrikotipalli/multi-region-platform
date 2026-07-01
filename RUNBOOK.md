@@ -47,6 +47,14 @@ aws route53 list-resource-record-sets \
   --hosted-zone-id <HOSTED_ZONE_ID> \
   --query "ResourceRecordSets[?Name=='app.multi-region-platform.internal.']"
 ```
+> ⚠️ **Known gap:** the Lambda's Route 53 `DELETE` call currently targets a `CNAME` record with
+> `SetIdentifier="aps1"`. The actual records created by `terraform/modules/route53/main.tf` are
+> **alias `A` records** with `SetIdentifier="ap-southeast-1"`. As written, the Lambda's DNS-removal
+> step will fail against real infrastructure (record not found / type mismatch) — the DB promotion
+> and SNS notification still succeed, but automatic DNS removal does not. See "Still To Do" in
+> `ARCHITECTURE.md` — Route 53 health-check-gated latency routing is still the primary failover path
+> (works independently of this Lambda step), so failover still functions end-to-end, just not via
+> this specific DNS-cleanup call. Fix before relying on it in production.
 
 **Step 4** — If RDS promotion did not complete automatically:
 ```bash

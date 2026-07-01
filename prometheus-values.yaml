@@ -1,0 +1,73 @@
+grafana:
+  enabled: true
+  adminPassword: "${GRAFANA_PASSWORD}"
+  service:
+    type: LoadBalancer
+  persistence:
+    enabled: false
+  datasources:
+    datasources.yaml:
+      apiVersion: 1
+      datasources:
+        - name: Prometheus
+          type: prometheus
+          url: http://prometheus-operated:9090
+          isDefault: true
+        - name: Loki
+          type: loki
+          url: http://loki:3100
+        - name: Tempo
+          type: tempo
+          url: http://tempo:3100
+
+prometheus:
+  prometheusSpec:
+    retention: 7d
+    serviceMonitorSelectorNilUsesHelmValues: false
+    remoteWrite:
+      - url: "${PROMETHEUS_REMOTE_WRITE_URL}"
+        headers:
+          X-Scope-OrgID: "${AWS_REGION}"
+    additionalRuleGroups:
+      - name: database-replication
+        rules:
+          - alert: RDSReplicationLagHigh
+            expr: aws_rds_replica_lag_average > 60
+            for: 5m
+            labels:
+              severity: warning
+            annotations:
+              summary: "RDS replication lag > 60s in {{ $labels.region }}"
+          - alert: RedisReplicationDown
+            expr: aws_elasticache_replication_bytes_average < 1
+            for: 2m
+            labels:
+              severity: critical
+            annotations:
+              summary: "Redis replication may be broken in {{ $labels.region }}"
+    additionalScrapeConfigs:
+      - job_name: "app-pods"
+        kubernetes_sd_configs:
+          - role: pod
+            namespaces:
+              names: ["multi-region"]
+        relabel_configs:
+          - source_labels: [__meta_kubernetes_pod_annotation_prometheus_io_scrape]
+            action: keep
+            regex: "true"
+          - source_labels: [__meta_kubernetes_pod_annotation_prometheus_io_path]
+            action: replace
+            target_label: __metrics_path__
+            regex: (.+)
+
+alertmanager:
+  config:
+    global:
+      smtp_smarthost: "smtp.gmail.com:587"
+    route:
+      receiver: "ops-email"
+    receivers:
+      - name: "ops-email"
+        email_configs:
+          - to: "${ONCALL_EMAIL}"
+            send_resolved: true
