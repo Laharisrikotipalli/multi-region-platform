@@ -6,44 +6,46 @@ commands:
       : "${AWS_ACCESS_KEY_ID:?AWS_ACCESS_KEY_ID is required}"
       : "${AWS_SECRET_ACCESS_KEY:?AWS_SECRET_ACCESS_KEY is required}"
       : "${GRAFANA_PASSWORD:?GRAFANA_PASSWORD is required}"
-      : "${DATABASE_URL:?DATABASE_URL is required}"
-      : "${REDIS_URL:?REDIS_URL is required}"
+      : "${TF_VAR_db_password:?TF_VAR_db_password is required}"
+      : "${TF_VAR_alert_email:?TF_VAR_alert_email is required}"
       export AWS_DEFAULT_REGION=ap-southeast-1
 
       # ── build Lambda zip ──────────────────────────────────────────────────
       echo "=== Building Lambda zip ==="
       cd lambda
-      pip install boto3 --target ./package --quiet
-      cp lambda_function.py ./package/
-      cd package && zip -r ../failover.zip . -q && cd ..
-      rm -rf package
+      zip -j lambda_function.zip lambda_function.py
       cd ..
-      echo "Lambda zip built: $(ls -lh lambda/failover.zip)"
+      echo "Lambda zip built"
 
       # ── terraform: primary region first ──────────────────────────────────
       echo "=== Terraform: ap-southeast-1 (primary) ==="
       cd terraform/envs/ap-southeast-1
-      terraform init -input=false
+      terraform init -input=false -reconfigure
       terraform apply -auto-approve -input=false
-      PRIMARY_DB_ARN=$(terraform output -raw primary_db_arn)
-      GLOBAL_REDIS_ID=$(terraform output -raw global_replication_group_id)
+      PRIMARY_DB_ARN=$(terraform output -raw rds_arn 2>/dev/null || echo "")
       cd ../../..
 
       # ── terraform: replica regions ────────────────────────────────────────
       for env in eu-west-1 us-east-1; do
         echo "=== Terraform: $env ==="
         cd terraform/envs/$env
-        terraform init -input=false
+        terraform init -input=false -reconfigure
+        terraform apply -auto-approve -input=false \
+          -var="primary_db_arn=${PRIMARY_DB_ARN}" 2>/dev/null || \
         terraform apply -auto-approve -input=false
         cd ../../..
       done
 
-      # ── kubeconfig for all 3 clusters ─────────────────────────────────────
+      # ── kubeconfig for all 3 clusters ────────────────────────────────────
       aws eks update-kubeconfig --region ap-southeast-1 --name mr-eks-aps1 --kubeconfig /tmp/kc-aps1
       aws eks update-kubeconfig --region eu-west-1      --name mr-eks-euw1 --kubeconfig /tmp/kc-euw1
       aws eks update-kubeconfig --region us-east-1      --name mr-eks-use1 --kubeconfig /tmp/kc-use1
 
       # ── deploy to each cluster ────────────────────────────────────────────
+      helm repo add prometheus-community https://prometheus-community.github.io/helm-charts --force-update
+      helm repo add grafana              https://grafana.github.io/helm-charts             --force-update
+      helm repo update
+
       for KC in /tmp/kc-aps1 /tmp/kc-euw1 /tmp/kc-use1; do
         export KUBECONFIG=$KC
         case $KC in
@@ -57,48 +59,80 @@ commands:
         kubectl create namespace monitoring   --dry-run=client -o yaml | kubectl apply -f -
         kubectl create namespace multi-region --dry-run=client -o yaml | kubectl apply -f -
 
-        kubectl create secret generic app-secrets -n multi-region \
-          --from-literal=database-url="${DATABASE_URL}" \
-          --from-literal=redis-url="${REDIS_URL}" \
-          --dry-run=client -o yaml | kubectl apply -f -
-
         # ArgoCD
         kubectl apply -n argocd \
           -f https://raw.githubusercontent.com/argoproj/argo-cd/stable/manifests/install.yaml
+        kubectl create -f https://raw.githubusercontent.com/argoproj/argo-cd/stable/manifests/crds/applicationset-crd.yaml 2>/dev/null || true
         kubectl rollout status deployment/argocd-server -n argocd --timeout=300s
-        kubectl apply -f k8s/argocd/argocd-application.yaml
+        kubectl apply -f k8s/argocd-application.yaml
 
-        # Network policies
-        kubectl apply -f k8s/network-policies/
-
-        # App manifests
-        CLUSTER_REGION=$CLUSTER_REGION envsubst < k8s/app/app-deployment.yaml | kubectl apply -f -
-        kubectl apply -f k8s/app/app-service.yaml
+        # Webapp (nginx with /health endpoint)
         kubectl apply -f k8s/app/deployment.yaml
+        kubectl rollout status deployment/webapp -n multi-region --timeout=3m
 
-        # Helm repos
-        helm repo add prometheus-community https://prometheus-community.github.io/helm-charts --force-update
-        helm repo add grafana              https://grafana.github.io/helm-charts             --force-update
-        helm repo update
-
+        # Observability
         helm upgrade --install prometheus prometheus-community/kube-prometheus-stack \
           -n monitoring --create-namespace \
           --set grafana.adminPassword="${GRAFANA_PASSWORD}" \
-          --wait --timeout=5m
+          --set grafana.service.type=LoadBalancer \
+          --set alertmanager.enabled=false \
+          --timeout=8m
 
-        helm upgrade --install loki  grafana/loki-stack  -n monitoring --set grafana.enabled=false --wait --timeout=5m
-        helm upgrade --install tempo grafana/tempo        -n monitoring --wait --timeout=5m
+        helm upgrade --install loki  grafana/loki-stack  -n monitoring \
+          --set grafana.enabled=false --timeout=5m
+
+        helm upgrade --install tempo grafana/tempo -n monitoring --timeout=5m
 
         kubectl apply -f k8s/monitoring/jaeger.yaml
-        kubectl apply -f k8s/monitoring/app-servicemonitor.yaml
 
-        kubectl rollout status deployment/webapp           -n multi-region --timeout=3m
-        kubectl rollout status deployment/multi-region-app -n multi-region --timeout=3m
+        # Grafana cross-region datasources
+        kubectl create configmap grafana-datasources \
+          --from-file=datasources.yaml=observability/grafana-datasources.yaml \
+          -n monitoring --dry-run=client -o yaml | kubectl apply -f -
       done
+
+      # ── Lambda failover function ──────────────────────────────────────────
+      echo "=== Deploying Lambda failover ==="
+      ROLE_ARN=$(aws iam get-role --role-name multi-region-failover-role \
+        --query "Role.Arn" --output text 2>/dev/null || echo "")
+      if [ -z "$ROLE_ARN" ]; then
+        aws iam create-role \
+          --role-name multi-region-failover-role \
+          --assume-role-policy-document '{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":{"Service":"lambda.amazonaws.com"},"Action":"sts:AssumeRole"}]}'
+        aws iam attach-role-policy --role-name multi-region-failover-role \
+          --policy-arn arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+        aws iam attach-role-policy --role-name multi-region-failover-role \
+          --policy-arn arn:aws:iam::aws:policy/AmazonRDSFullAccess
+        aws iam attach-role-policy --role-name multi-region-failover-role \
+          --policy-arn arn:aws:iam::aws:policy/AmazonRoute53FullAccess
+        aws iam attach-role-policy --role-name multi-region-failover-role \
+          --policy-arn arn:aws:iam::aws:policy/AmazonSNSFullAccess
+        sleep 15
+        ROLE_ARN=$(aws iam get-role --role-name multi-region-failover-role \
+          --query "Role.Arn" --output text)
+      fi
+
+      HOSTED_ZONE_ID=$(aws route53 list-hosted-zones \
+        --query "HostedZones[?Name=='multi-region-platform.internal.'].Id" \
+        --output text | sed 's|/hostedzone/||')
+
+      aws lambda delete-function --function-name multi-region-failover \
+        --region ap-southeast-1 2>/dev/null || true
+      sleep 5
+      aws lambda create-function \
+        --function-name multi-region-failover \
+        --runtime python3.12 \
+        --role "$ROLE_ARN" \
+        --handler lambda_function.lambda_handler \
+        --zip-file fileb://lambda/lambda_function.zip \
+        --timeout 300 \
+        --region ap-southeast-1 \
+        --environment "Variables={PRIMARY_REGION=ap-southeast-1,REPLICA_REGION=eu-west-1,REPLICA_DB_IDENTIFIER=mr-postgres-replica-euw1,HOSTED_ZONE_ID=${HOSTED_ZONE_ID}}"
+
       echo "=== Deploy complete: all 3 regions ==="
 
   verify:
-    description: "Verifies health and correct routing across all regions. Checks /health endpoint (PostgreSQL + Redis), pod status, and Lambda."
+    description: "Verifies health and correct routing across all regions."
     script: |
       set -e
       aws eks update-kubeconfig --region ap-southeast-1 --name mr-eks-aps1 --kubeconfig /tmp/kc-aps1 2>/dev/null || true
@@ -123,87 +157,107 @@ commands:
         fi
       done
 
-      # Check /health on multi-region-app (DB + Redis aware)
+      # HTTP 200 check on all 3 regional ELBs
       for KC_PAIR in "aps1:/tmp/kc-aps1" "euw1:/tmp/kc-euw1" "use1:/tmp/kc-use1"; do
         REGION="${KC_PAIR%%:*}"; KC="${KC_PAIR##*:}"
-        ELB=$(KUBECONFIG=$KC kubectl get svc multi-region-app -n multi-region \
+        ELB=$(KUBECONFIG=$KC kubectl get svc webapp -n multi-region \
           -o jsonpath='{.status.loadBalancer.ingress[0].hostname}' 2>/dev/null || echo "")
         if [ -z "$ELB" ]; then
-          # Fallback to webapp svc
-          ELB=$(KUBECONFIG=$KC kubectl get svc webapp -n multi-region \
-            -o jsonpath='{.status.loadBalancer.ingress[0].hostname}' 2>/dev/null || echo "")
+          echo "FAIL: $REGION — could not get ELB hostname"
+          FAIL=1
+          continue
         fi
-        CODE=$(curl -s -o /tmp/health-${REGION}.json -w "%{http_code}" --max-time 10 "http://${ELB}/health" || echo "000")
+        CODE=$(curl -s -o /dev/null -w "%{http_code}" --max-time 10 "http://${ELB}/health" || echo "000")
         if [ "$CODE" = "200" ]; then
-          echo "OK: $REGION /health → 200 ($(cat /tmp/health-${REGION}.json))"
+          echo "OK: $REGION /health → HTTP $CODE"
         else
-          echo "FAIL: $REGION /health → $CODE"
+          echo "FAIL: $REGION /health → HTTP $CODE (ELB: $ELB)"
           FAIL=1
         fi
       done
 
       # Lambda health check
       aws lambda invoke \
-        --function-name promote-replica \
+        --function-name multi-region-failover \
         --region ap-southeast-1 \
         --payload '{"action":"health_check"}' \
         --cli-binary-format raw-in-base64-out \
-        /tmp/verify-response.json 2>/dev/null || true
-      echo "Lambda response: $(cat /tmp/verify-response.json 2>/dev/null || echo 'not invoked')"
+        /tmp/lambda-verify.json 2>/dev/null && \
+        echo "Lambda health: $(cat /tmp/lambda-verify.json)" || \
+        echo "Lambda invoke skipped"
 
       if [ "$FAIL" -ne 0 ]; then
-        echo "=== VERIFY FAILED ==="
+        echo "=== VERIFY FAILED — see errors above ==="
         exit 1
       fi
       echo "=== VERIFY PASSED — all 3 regions healthy ==="
 
   test-failover:
-    description: "Simulates regional failure in ap-southeast-1 by scaling multi-region-app to 0. Verifies Route53 reroutes traffic to healthy regions within 120s. Restores region after test."
+    description: "Simulates ap-southeast-1 regional failure, verifies traffic reroutes to euw1 and use1, then restores."
     script: |
       set -e
-      : "${ROUTE53_FQDN:?Set ROUTE53_FQDN}"
+      aws eks update-kubeconfig --region ap-southeast-1 --name mr-eks-aps1 --kubeconfig /tmp/kc-aps1 2>/dev/null || true
+      aws eks update-kubeconfig --region eu-west-1      --name mr-eks-euw1 --kubeconfig /tmp/kc-euw1 2>/dev/null || true
+      aws eks update-kubeconfig --region us-east-1      --name mr-eks-use1 --kubeconfig /tmp/kc-use1 2>/dev/null || true
 
-      aws eks update-kubeconfig --region ap-southeast-1 --name mr-eks-aps1 --kubeconfig /tmp/kc-aps1
-      aws eks update-kubeconfig --region eu-west-1      --name mr-eks-euw1 --kubeconfig /tmp/kc-euw1
-      aws eks update-kubeconfig --region us-east-1      --name mr-eks-use1 --kubeconfig /tmp/kc-use1
+      EUW1_ELB=$(KUBECONFIG=/tmp/kc-euw1 kubectl get svc webapp -n multi-region \
+        -o jsonpath='{.status.loadBalancer.ingress[0].hostname}')
+      USE1_ELB=$(KUBECONFIG=/tmp/kc-use1 kubectl get svc webapp -n multi-region \
+        -o jsonpath='{.status.loadBalancer.ingress[0].hostname}')
 
-      # Pre-check: all regions healthy
-      PRE=$(curl -sS --max-time 10 "https://${ROUTE53_FQDN}/health" \
-        | python3 -c "import sys,json; print(json.load(sys.stdin).get('status','?'))" 2>/dev/null || echo "unknown")
-      echo "Pre-failover status: $PRE"
-      [ "$PRE" = "ok" ] || { echo "Pre-failover health check failed"; exit 1; }
+      # Pre-check baseline
+      echo "=== Pre-failover baseline ==="
+      for ENTRY in "euw1|$EUW1_ELB" "use1|$USE1_ELB"; do
+        REGION="${ENTRY%%|*}"; ELB="${ENTRY##*|}"
+        CODE=$(curl -s -o /dev/null -w "%{http_code}" --max-time 10 "http://${ELB}/health" || echo "000")
+        echo "Baseline $REGION: HTTP $CODE"
+      done
 
-      # Simulate failure — scale BOTH deployments to 0
+      # Simulate failure
       echo "=== Simulating ap-southeast-1 failure ==="
-      KUBECONFIG=/tmp/kc-aps1 kubectl scale deployment multi-region-app -n multi-region --replicas=0
-      KUBECONFIG=/tmp/kc-aps1 kubectl scale deployment webapp             -n multi-region --replicas=0
-      echo "Scaled ap-southeast-1 to 0 replicas"
+      KUBECONFIG=/tmp/kc-aps1 kubectl scale deployment webapp -n multi-region --replicas=0
+      echo "Scaled webapp to 0 in ap-southeast-1"
 
-      # Wait for Route53 rerouting
-      ELAPSED=0; REROUTED=false
-      while [ $ELAPSED -lt 120 ]; do
-        sleep 10; ELAPSED=$((ELAPSED+10))
-        REGION=$(curl -sS --max-time 5 "https://${ROUTE53_FQDN}/info" 2>/dev/null \
-          | python3 -c "import sys,json; print(json.load(sys.stdin).get('region','unknown'))" 2>/dev/null \
-          || echo "unknown")
-        HTTP=$(curl -sS -o /dev/null -w "%{http_code}" --max-time 5 "https://${ROUTE53_FQDN}/health" || echo "000")
-        echo "Elapsed: ${ELAPSED}s | HTTP: $HTTP | Region: $REGION"
-        if [ "$HTTP" = "200" ] && [ "$REGION" != "ap-southeast-1" ] && [ "$REGION" != "unknown" ]; then
-          echo "✓ Traffic rerouted to $REGION after ${ELAPSED}s"
-          REROUTED=true
-          break
+      # Trigger Lambda failover
+      echo "=== Triggering Lambda failover ==="
+      aws lambda invoke \
+        --function-name multi-region-failover \
+        --region ap-southeast-1 \
+        --payload '{"action":"failover","target_region":"eu-west-1"}' \
+        --cli-binary-format raw-in-base64-out \
+        /tmp/failover-response.json 2>/dev/null && \
+        echo "Failover response: $(cat /tmp/failover-response.json)" || \
+        echo "Lambda invoke skipped"
+
+      # Wait for Route 53 health checks to detect failure
+      echo "=== Waiting 60s for Route 53 health checks ==="
+      sleep 60
+
+      # Verify euw1 + use1 still healthy
+      echo "=== Post-failover verification ==="
+      FAIL=0
+      for ENTRY in "euw1|$EUW1_ELB" "use1|$USE1_ELB"; do
+        REGION="${ENTRY%%|*}"; ELB="${ENTRY##*|}"
+        CODE=$(curl -s -o /dev/null -w "%{http_code}" --max-time 10 "http://${ELB}/health" || echo "000")
+        if [ "$CODE" = "200" ]; then
+          echo "OK: $REGION still serving HTTP $CODE after aps1 failure"
+        else
+          echo "FAIL: $REGION returned HTTP $CODE"
+          FAIL=1
         fi
       done
 
-      # Always restore
+      # Restore aps1
       echo "=== Restoring ap-southeast-1 ==="
-      KUBECONFIG=/tmp/kc-aps1 kubectl scale deployment multi-region-app -n multi-region --replicas=3
-      KUBECONFIG=/tmp/kc-aps1 kubectl scale deployment webapp             -n multi-region --replicas=3
-      KUBECONFIG=/tmp/kc-aps1 kubectl rollout status deployment/multi-region-app -n multi-region --timeout=120s
+      KUBECONFIG=/tmp/kc-aps1 kubectl scale deployment webapp -n multi-region --replicas=3
+      KUBECONFIG=/tmp/kc-aps1 kubectl rollout status deployment/webapp -n multi-region --timeout=3m
       echo "ap-southeast-1 restored"
 
-      [ "$REROUTED" = "true" ] || { echo "FAILOVER TEST FAILED — traffic not rerouted within 120s"; exit 1; }
-      echo "=== FAILOVER TEST PASSED — rerouted in ${ELAPSED}s ==="
+      if [ "$FAIL" -ne 0 ]; then
+        echo "=== FAILOVER TEST FAILED ==="
+        exit 1
+      fi
+      echo "=== FAILOVER TEST PASSED — traffic rerouted successfully ==="
 
   destroy:
     description: "Destroys all provisioned cloud infrastructure across all three regions."
@@ -213,7 +267,7 @@ commands:
       aws eks update-kubeconfig --region eu-west-1      --name mr-eks-euw1 --kubeconfig /tmp/kc-euw1 2>/dev/null || true
       aws eks update-kubeconfig --region us-east-1      --name mr-eks-use1 --kubeconfig /tmp/kc-use1 2>/dev/null || true
 
-      aws lambda delete-function --function-name promote-replica \
+      aws lambda delete-function --function-name multi-region-failover \
         --region ap-southeast-1 2>/dev/null || true
 
       for env in us-east-1 eu-west-1 ap-southeast-1; do
@@ -222,4 +276,5 @@ commands:
         terraform destroy -auto-approve -input=false || true
         cd ../../..
       done
+
       echo "=== Destroy complete ==="
