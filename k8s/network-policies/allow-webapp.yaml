@@ -8,7 +8,7 @@ metadata:
 spec:
   podSelector:
     matchLabels:
-      app: multi-region-app
+      app: webapp
   policyTypes:
     - Ingress
     - Egress
