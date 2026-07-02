@@ -4,21 +4,26 @@
 
 grafana:
   enabled: true
-  adminPassword: "${GRAFANA_ADMIN_PASSWORD}"
+  adminPassword: "${GRAFANA_PASSWORD}"
   service:
     type: LoadBalancer
   persistence:
     enabled: false
-  # Pre-configure all three datasources so Grafana shows metrics, logs,
-  # and traces from a single dashboard.
+  sidecar:
+    datasources:
+      # kube-prometheus-stack auto-provisions its OWN default Prometheus datasource
+      # (ConfigMap named "<release>-kube-prometheus-grafana-datasource") regardless
+      # of this flag in this chart version. Rather than fight that, we simply don't
+      # define our own competing "Prometheus" entry below — see note there.
+      defaultDatasourceEnabled: true
+  # Pre-configure Loki and Tempo (Prometheus is already auto-provisioned as the
+  # default datasource by the chart itself — see sidecar.datasources above —
+  # so we deliberately do NOT redefine Prometheus here to avoid two datasources
+  # both claiming isDefault: true, which crashes Grafana on startup.
   datasources:
     datasources.yaml:
       apiVersion: 1
       datasources:
-        - name: Prometheus
-          type: prometheus
-          url: http://prometheus-operated:9090
-          isDefault: true
         - name: Loki
           type: loki
           url: http://loki:3100
