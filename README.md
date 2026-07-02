@@ -12,7 +12,7 @@ RDS PostgreSQL, ElastiCache Redis, and Amazon Route 53.
 | Load Balancing | Kubernetes `Service: LoadBalancer` | AWS ELB per region, exposes `/health` for Route 53 |
 | Traffic Management | Amazon Route 53 | Latency-based routing; health checks auto-remove unhealthy regions |
 | Database | Amazon RDS PostgreSQL 15 | Primary in `ap-southeast-1`; async read replicas in other regions |
-| Cache | Amazon ElastiCache Redis | Independent cluster per region |
+| Cache | Amazon ElastiCache Redis | Independent cluster per region (no cross-region replication — Redis is a read cache; cold-start on failover is acceptable; see ARCHITECTURE.md for trade-off rationale) |
 | GitOps | ArgoCD | Per-cluster; syncs from this repo — no single point of failure |
 | Observability | Prometheus + Grafana + Loki + Tempo | All clusters; cross-region datasources in Grafana |
 | DR Automation | AWS Lambda + CloudWatch Alarm | Auto-promotes RDS replica + updates Route 53 on failure |

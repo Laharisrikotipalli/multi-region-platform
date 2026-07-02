@@ -10,7 +10,6 @@ commands:
       : "${TF_VAR_alert_email:?TF_VAR_alert_email is required}"
       export AWS_DEFAULT_REGION=ap-southeast-1
 
-      # ── bootstrap S3 state buckets (must match backend blocks in each main.tf) ──
       echo "=== Bootstrapping Terraform state buckets ==="
       for pair in "ap-southeast-1:mr-tfstate-aps1-515422922112" "eu-west-1:mr-tfstate-euw1-515422922112" "us-east-1:mr-tfstate-use1-515422922112"; do
         region="${pair%%:*}"; bucket="${pair##*:}"
@@ -20,21 +19,18 @@ commands:
         aws s3api put-bucket-versioning --bucket "$bucket" --versioning-configuration Status=Enabled
       done
 
-      # ── build Lambda zip ──────────────────────────────────────────────────
       echo "=== Building Lambda zip ==="
       cd lambda
       zip -j lambda_function.zip lambda_function.py
       cd ..
       echo "Lambda zip built"
 
-      # ── terraform: primary region first ──────────────────────────────────
       echo "=== Terraform: ap-southeast-1 (primary) ==="
       cd terraform/envs/ap-southeast-1
       terraform init -input=false -reconfigure
       terraform apply -auto-approve -input=false
       cd ../../..
 
-      # ── terraform: replica regions (pull primary DB ARN via terraform_remote_state) ──
       for env in eu-west-1 us-east-1; do
         echo "=== Terraform: $env ==="
         cd terraform/envs/$env
@@ -43,12 +39,10 @@ commands:
         cd ../../..
       done
 
-      # ── kubeconfig for all 3 clusters ────────────────────────────────────
       aws eks update-kubeconfig --region ap-southeast-1 --name mr-eks-aps1 --kubeconfig /tmp/kc-aps1
       aws eks update-kubeconfig --region eu-west-1      --name mr-eks-euw1 --kubeconfig /tmp/kc-euw1
       aws eks update-kubeconfig --region us-east-1      --name mr-eks-use1 --kubeconfig /tmp/kc-use1
 
-      # ── deploy to each cluster ────────────────────────────────────────────
       helm repo add prometheus-community https://prometheus-community.github.io/helm-charts --force-update
       helm repo add grafana              https://grafana.github.io/helm-charts             --force-update
       helm repo update
@@ -66,8 +60,6 @@ commands:
         kubectl create namespace monitoring   --dry-run=client -o yaml | kubectl apply -f -
         kubectl create namespace multi-region --dry-run=client -o yaml | kubectl apply -f -
 
-        # ── app-secrets + cluster-config must exist BEFORE ArgoCD syncs the app ────
-        # ── (pods crash-loop without DATABASE_URL/REDIS_URL) ────────────────────────
         echo "=== Fetching DB/Redis endpoints for $CLUSTER_REGION ==="
         DB_ENDPOINT=$(cd "terraform/envs/$CLUSTER_REGION" && terraform output -raw db_endpoint)
         REDIS_ENDPOINT=$(cd "terraform/envs/$CLUSTER_REGION" && terraform output -raw redis_endpoint)
@@ -83,18 +75,15 @@ commands:
           --from-literal=aws-region="$CLUSTER_REGION" \
           --dry-run=client -o yaml | kubectl apply -f -
 
-        # ArgoCD
         kubectl apply -n argocd \
           -f https://raw.githubusercontent.com/argoproj/argo-cd/stable/manifests/install.yaml
         kubectl create -f https://raw.githubusercontent.com/argoproj/argo-cd/stable/manifests/crds/applicationset-crd.yaml 2>/dev/null || true
         kubectl rollout status deployment/argocd-server -n argocd --timeout=300s
         kubectl apply -f k8s/argocd-application.yaml
 
-        # Webapp (real FastAPI app — /health checks Postgres + Redis)
         kubectl apply -f k8s/app/deployment.yaml
         kubectl rollout status deployment/webapp -n multi-region --timeout=3m
 
-        # Observability
         helm upgrade --install prometheus prometheus-community/kube-prometheus-stack \
           -n monitoring --create-namespace \
           --set grafana.adminPassword="${GRAFANA_PASSWORD}" \
@@ -109,13 +98,11 @@ commands:
 
         kubectl apply -f k8s/monitoring/jaeger.yaml
 
-        # Grafana cross-region datasources
         kubectl create configmap grafana-datasources \
           --from-file=datasources.yaml=observability/grafana-datasources.yaml \
           -n monitoring --dry-run=client -o yaml | kubectl apply -f -
       done
 
-      # ── Lambda failover function ──────────────────────────────────────────
       echo "=== Deploying Lambda failover ==="
       ROLE_ARN=$(aws iam get-role --role-name multi-region-failover-role \
         --query "Role.Arn" --output text 2>/dev/null || echo "")
@@ -153,6 +140,36 @@ commands:
         --region ap-southeast-1 \
         --environment "Variables={PRIMARY_REGION=ap-southeast-1,REPLICA_REGION=eu-west-1,REPLICA_DB_IDENTIFIER=mr-postgres-replica-euw1,HOSTED_ZONE_ID=${HOSTED_ZONE_ID}}"
 
+      echo "=== Wiring Route 53 with real ELB endpoints ==="
+      APS1_ELB=$(KUBECONFIG=/tmp/kc-aps1 kubectl get svc webapp -n multi-region \
+        -o jsonpath='{.status.loadBalancer.ingress[0].hostname}')
+      EUW1_ELB=$(KUBECONFIG=/tmp/kc-euw1 kubectl get svc webapp -n multi-region \
+        -o jsonpath='{.status.loadBalancer.ingress[0].hostname}')
+      USE1_ELB=$(KUBECONFIG=/tmp/kc-use1 kubectl get svc webapp -n multi-region \
+        -o jsonpath='{.status.loadBalancer.ingress[0].hostname}')
+
+      APS1_ZONE=$(aws elb describe-load-balancers --region ap-southeast-1 \
+        --query "LoadBalancerDescriptions[?DNSName=='${APS1_ELB}'].CanonicalHostedZoneNameID" \
+        --output text)
+      EUW1_ZONE=$(aws elb describe-load-balancers --region eu-west-1 \
+        --query "LoadBalancerDescriptions[?DNSName=='${EUW1_ELB}'].CanonicalHostedZoneNameID" \
+        --output text)
+      USE1_ZONE=$(aws elb describe-load-balancers --region us-east-1 \
+        --query "LoadBalancerDescriptions[?DNSName=='${USE1_ELB}'].CanonicalHostedZoneNameID" \
+        --output text)
+
+      echo "aps1 ELB: $APS1_ELB ($APS1_ZONE)"
+      echo "euw1 ELB: $EUW1_ELB ($EUW1_ZONE)"
+      echo "use1 ELB: $USE1_ELB ($USE1_ZONE)"
+
+      cd terraform/envs/ap-southeast-1
+      terraform apply -auto-approve -input=false \
+        -var="aps1_elb_dns=${APS1_ELB}"  -var="aps1_elb_zone_id=${APS1_ZONE}" \
+        -var="euw1_elb_dns=${EUW1_ELB}"  -var="euw1_elb_zone_id=${EUW1_ZONE}" \
+        -var="use1_elb_dns=${USE1_ELB}"  -var="use1_elb_zone_id=${USE1_ZONE}"
+      cd ../../..
+      echo "Route 53 latency records + health checks created"
+
       echo "=== Deploy complete: all 3 regions ==="
 
   verify:
@@ -181,7 +198,6 @@ commands:
         fi
       done
 
-      # HTTP 200 check on all 3 regional ELBs
       for KC_PAIR in "aps1:/tmp/kc-aps1" "euw1:/tmp/kc-euw1" "use1:/tmp/kc-use1"; do
         REGION="${KC_PAIR%%:*}"; KC="${KC_PAIR##*:}"
         ELB=$(KUBECONFIG=$KC kubectl get svc webapp -n multi-region \
@@ -200,7 +216,6 @@ commands:
         fi
       done
 
-      # Lambda health check
       aws lambda invoke \
         --function-name multi-region-failover \
         --region ap-southeast-1 \
@@ -229,7 +244,6 @@ commands:
       USE1_ELB=$(KUBECONFIG=/tmp/kc-use1 kubectl get svc webapp -n multi-region \
         -o jsonpath='{.status.loadBalancer.ingress[0].hostname}')
 
-      # Pre-check baseline
       echo "=== Pre-failover baseline ==="
       for ENTRY in "euw1|$EUW1_ELB" "use1|$USE1_ELB"; do
         REGION="${ENTRY%%|*}"; ELB="${ENTRY##*|}"
@@ -237,12 +251,10 @@ commands:
         echo "Baseline $REGION: HTTP $CODE"
       done
 
-      # Simulate failure
       echo "=== Simulating ap-southeast-1 failure ==="
       KUBECONFIG=/tmp/kc-aps1 kubectl scale deployment webapp -n multi-region --replicas=0
       echo "Scaled webapp to 0 in ap-southeast-1"
 
-      # Trigger Lambda failover
       echo "=== Triggering Lambda failover ==="
       aws lambda invoke \
         --function-name multi-region-failover \
@@ -253,11 +265,9 @@ commands:
         echo "Failover response: $(cat /tmp/failover-response.json)" || \
         echo "Lambda invoke skipped"
 
-      # Wait for Route 53 health checks to detect failure
       echo "=== Waiting 60s for Route 53 health checks ==="
       sleep 60
 
-      # Verify euw1 + use1 still healthy
       echo "=== Post-failover verification ==="
       FAIL=0
       for ENTRY in "euw1|$EUW1_ELB" "use1|$USE1_ELB"; do
@@ -271,7 +281,6 @@ commands:
         fi
       done
 
-      # Restore aps1
       echo "=== Restoring ap-southeast-1 ==="
       KUBECONFIG=/tmp/kc-aps1 kubectl scale deployment webapp -n multi-region --replicas=3
       KUBECONFIG=/tmp/kc-aps1 kubectl rollout status deployment/webapp -n multi-region --timeout=3m
